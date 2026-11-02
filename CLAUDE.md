@@ -6,22 +6,45 @@ If you ever have any questions about anything related to the setup just ask.
 
 ## Repo layout
 
-- `firmware/motor_node/motor_node.ino`: Teensy 4.1 firmware, one copy per motor. Change `MOTOR_ID` to flash boards 2-4. Flashed by the user from the Arduino IDE; Claude can't compile or flash from its sandbox.
-- `utils/mqtt_handler.py`, `utils/data_manager.py`: MQTT wrapper, CSV logging, and the state-packet parser.
-- `monitor_state.py`: read-only live view of a motor's state topic.
+- `firmware/motor_node/motor_node.ino`: Teensy 4.1 firmware, one copy per motor. Change `MOTOR_ID` (and check `ENCODER_SIGN`) to flash boards 2-4. Flashed by the user from the Arduino IDE; Claude can't compile or flash from its sandbox.
+  - A 1 kHz `IntervalTimer` interrupt does the control update (watchdog, ramp, PWM) and the encoder sample into a ring buffer. `loop()` only handles networking.
+- `utils/data_manager.py`: state-packet parser plus CSV logging; counts lost packets and Teensy-dropped samples.
+- `utils/test_profiles.py`: `step_plan()` and `sweep_plan()` build a validated `TestPlan` (profile, duration, CSV name and metadata, warnings). The scripts and the control panel both use these, so a test produces the same CSV either way. Add new test types here.
+- `utils/test_runner.py`: `run_profile(motor_id, plan, notes)` for the terminal scripts. It sends effort(t) at 20 Hz, records at 1 kHz, refuses to start if packets don't parse, and always sends 0 at the end.
+- `utils/mqtt_handler.py`: paho wrapper.
+- `monitor_state.py`: read-only live view.
 - `drive_motor.py`: interactive manual effort commands.
-- `step_response_test.py`: on/off effort test that logs to `data/motor_<id>/*.csv`. Run it from the repo root, since `data/` is a relative path.
-- `data/`: recorded runs. Files from before 2026-11-02 used older firmware, where position/velocity were placeholders.
+- `step_response_test.py`: on/off effort test (prompts for parameters).
+- `sweep_test.py`: slow 0 → max → 0 sweep, both directions by default, for the effort→speed map. Takes command-line options; see `--help`.
+- `control_panel.py` plus `control_panel/index.html`: browser control panel at `http://127.0.0.1:8080` (localhost only, by user choice).
+  - Live data for motors 1-4 with charts (10 s / 30 s / 2 min window, Pause), Set-then-Apply effort commands, per-motor Stop, and STOP ALL (also the Esc key). STOP ALL also aborts tests.
+  - Recording: optional per-motor CSV recording (`*_manual_panel.csv`), and Record all, which starts every online motor with shared notes and a `record_group` ID in the metadata. Different Teensys' clocks aren't synchronized, so files in a group line up only to about one packet (50 ms).
+  - Each card has "Run a test" (step or sweep from `test_profiles.py`) with a live preview, a confirm dialog and a progress bar. While a test runs it owns that motor: manual commands and its recording are locked. It aborts on Stop, STOP ALL, a closed page, server shutdown, or 2 s without data, and partial CSVs are always saved.
+  - Panel-added features so far are the user's picks (tests, Record all, chart controls). Suggested but not built: auto safety stops (overspeed, stall/dead encoder), temperature readings, a session log, and pair mode.
+  - The server is stdlib Python plus paho, and the page has no external dependencies.
+  - Each card has an Electrical row (voltage, current, power = V×I). It shows "sensors not wired" until that motor's ID is added to `POWER_SENSORS` in `control_panel.py`, after the sensors are wired and `currentScale`/`voltageScale` are calibrated in the firmware. Today V/I come from the packet header at about 20 Hz.
+  - The user doesn't want an instant-cut command; the HV killswitch is the emergency stop.
+  - Safety: commands are published only while a target is non-zero, so an idle panel doesn't fight scripts. If no browser has been connected for 1 s, it stops the motors it was driving and saves recordings. POSTs are checked against Host, Origin and JSON content type.
+- Run the scripts from the repo root, since `data/` is a relative path. Results go in `data/motor_<id>/*.csv`.
+- `data/`: recorded runs, in three formats:
+  - before 2026-11-02 18:00 UTC: old firmware, position/velocity were placeholders;
+  - 2026-11-02 18:1x: 5 Hz, one row per packet;
+  - later: 1 kHz, one row per sample.
+- `data/` is git-ignored (user's choice; 1 kHz runs are about 9 MB each). The CSVs committed before that rule stay tracked, so checking out old commits doesn't delete files from disk.
+- Git tag `motor1-working-5hz` marks the last 5 Hz version.
 
 ## MQTT interface
 
 - Broker: `192.168.10.1:1883` (this PC). Teensys get their IP via DHCP.
 - `robot/motor/<id>/command`: one little-endian float32 effort in [-1, 1].
-- `robot/motor/<id>/state`: 24-byte packed struct at 5 Hz, `struct.unpack('<Ifffif')`:
-  `micros, effort_out, current, voltage, encoder_count (int32), velocity_rad_s`.
-  - Position is sent as raw counts because a float in radians loses resolution after a few thousand revolutions. `parse_motor_state()` converts it to `position_rad`.
-  - Current and voltage are not wired up or calibrated yet.
-  - The firmware and `utils/data_manager.py` must match: after changing the packet, reflash and update the parser together.
+- `robot/motor/<id>/state`: batched packet (version 2) at 20 Hz.
+  - Header `'<HHIIff'` (20 B): `version, sample_count, sequence, dropped_samples, current, voltage`.
+  - Then 50 samples of `'<Iif'` (12 B each): `timestamp_us, encoder_count, effort_out`, one per ms.
+  - Position is sent as raw int32 counts; Python converts to radians in double precision.
+  - Velocity is computed on the PC. CSVs use a centered difference over 10 ms; raw counts are always logged too.
+  - A `sequence` gap means MQTT lost a packet. A rising `dropped_samples` means the Teensy's buffer overflowed.
+  - Current and voltage are batch-rate placeholders; the sensors aren't wired up or calibrated yet.
+  - The firmware and `utils/data_manager.py` must match. `PACKET_VERSION` is checked, and a mismatch prints "reflash the Teensy".
 
 ## Bench hardware notes
 

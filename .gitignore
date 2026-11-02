@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Test data stays local (1 kHz runs are ~9 MB each). CSVs committed before this rule stay tracked.
+data/

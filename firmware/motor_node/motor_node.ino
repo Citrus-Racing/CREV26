@@ -4,14 +4,21 @@
 // One of these runs per motor. It:
 //   - receives an effort command [-1, +1] over MQTT and drives the motor
 //     controller with PWM (throttle) + an open-drain direction line
-//   - reads the shaft encoder and publishes position/velocity over MQTT
+//   - samples the shaft encoder at 1 kHz and publishes the samples over MQTT
+//     in batches (see STATE PACKET below)
 //
-// To flash a different motor's board, change MOTOR_ID below. Nothing else.
+// Timing: a 1 kHz hardware timer interrupt (sampleISR) does the control update
+// (watchdog, ramp, PWM) and takes the encoder sample. The main loop only
+// handles networking, so control and sampling keep running even while the
+// network is busy or reconnecting.
+//
+// To flash a different motor's board, change MOTOR_ID and check ENCODER_SIGN.
 // ============================================================================
 #include <NativeEthernet.h>
 #include <PubSubClient.h>
 #include <TimerEvent.h>
 #include <Encoder.h>
+#include <IntervalTimer.h>
 
 // ============================================================================
 // PER-BOARD CONFIGURATION
@@ -53,7 +60,6 @@ const uint8_t WHEEL_ENCODER_B_PIN = 17;
 // ============================================================================
 const float ENCODER_PPR    = 600.0f;
 const float COUNTS_PER_REV = 4.0f * ENCODER_PPR;            // 2400
-const float RAD_PER_COUNT  = 2.0f * PI / COUNTS_PER_REV;
 // Positive effort must read as positive velocity. Motor 1 needs -1 (verified
 // 2026-11-02). Check this on each new board and flip it if it's backwards.
 const long  ENCODER_SIGN   = -1;
@@ -68,112 +74,152 @@ const long  ENCODER_SIGN   = -1;
 // ============================================================================
 const float RAMP_UP_PER_S   = 0.25f;   // when |effort| is increasing
 const float RAMP_DOWN_PER_S = 0.25f;   // when |effort| is decreasing
-const unsigned long COMMAND_TIMEOUT_MS = 1000;  // no command for this long -> target 0
+const uint32_t COMMAND_TIMEOUT_MS = 1000;  // no command for this long -> target 0
 const uint8_t PWM_MAX = 255;           // 8-bit analogWrite
 
 // ============================================================================
-// DEFINE MOTOR STATE PACKET (explicitly packed to avoid alignment padding)
+// SAMPLING CONFIGURATION
 // ============================================================================
-struct __attribute__((packed)) MotorState {
-  unsigned long timeStamp;  // micros() when the encoder was sampled - 4 bytes
-  float effortCommand;      // Effort actually being output [-1.0, +1.0] (after ramp) - 4 bytes
-  float current;            // Motor current (amps) - 4 bytes (uncalibrated / not wired)
-  float voltage;            // Motor voltage (volts) - 4 bytes (uncalibrated / not wired)
-  int32_t encoderCount;     // Raw encoder count since boot (COUNTS_PER_REV per rev) - 4 bytes
-  float velocity;           // Shaft velocity, averaged over the publish period (rad/s) - 4 bytes
-};
-// Total: 24 bytes (no padding). Python side: struct.unpack('<Ifffif', payload)
-// Position goes out as raw counts, not float radians: a float loses
-// resolution once the shaft has turned a few thousand revs since boot.
-// The PC converts counts to radians in double precision.
+const int      SAMPLE_PERIOD_US   = 1000;  // 1 kHz control update + encoder sample
+const uint16_t SAMPLES_PER_PACKET = 50;    // -> 20 MQTT packets/s
+const uint32_t RING_SIZE          = 4096;  // ~4 s of buffering if the network stalls
+static_assert((RING_SIZE & (RING_SIZE - 1)) == 0, "RING_SIZE must be a power of two");
 
-MotorState motorState = {0, 0.0f, 0.0f, 0.0f, 0, 0.0f};
+// ============================================================================
+// STATE PACKET (version 2) - published on stateTopic, little-endian, packed
+// ----------------------------------------------------------------------------
+//   PacketHeader (20 bytes) followed by sampleCount x Sample (12 bytes each)
+//   Python: header '<HHIIff', then each sample '<Iif'
+// ============================================================================
+const uint16_t PACKET_VERSION = 2;
+
+struct __attribute__((packed)) PacketHeader {
+  uint16_t version;         // PACKET_VERSION
+  uint16_t sampleCount;     // number of samples that follow
+  uint32_t sequence;        // packet counter since boot; a gap = MQTT lost a packet
+  uint32_t droppedSamples;  // samples lost on the Teensy (buffer overflow), cumulative since boot
+  float current;            // batch-rate, uncalibrated (sensors not wired yet)
+  float voltage;            // batch-rate, uncalibrated (sensors not wired yet)
+};
+static_assert(sizeof(PacketHeader) == 20, "PacketHeader must be 20 bytes");
+
+struct __attribute__((packed)) Sample {
+  uint32_t timeStamp;       // micros() when sampled
+  int32_t  encoderCount;    // raw count since boot, ENCODER_SIGN applied (COUNTS_PER_REV per rev)
+  float    effort;          // effort being output at that instant [-1, +1]
+};
+static_assert(sizeof(Sample) == 12, "Sample must be 12 bytes");
+
+// ============================================================================
+// DRIVE STATE (shared between the MQTT callback, the main loop and the ISR)
+// ============================================================================
+volatile float targetEffort = 0.0f;          // latest commanded effort [-1, +1]
+volatile float currentEffort = 0.0f;         // effort actually being output (ramped)
+volatile uint32_t lastCommandMillis = 0;     // millis() of last valid command
+volatile bool commandTimedOut = true;        // true until the first command arrives
+volatile bool timeoutEvent = false;          // set by ISR, reported by loop
+
+// ============================================================================
+// SAMPLE BUFFER (single producer = ISR, single consumer = main loop)
+// ============================================================================
+Sample ring[RING_SIZE];
+volatile uint32_t ringHead = 0;              // next slot the ISR writes (only ISR changes it)
+volatile uint32_t ringTail = 0;              // next slot the loop reads (only loop changes it)
+volatile uint32_t droppedSamples = 0;
+uint32_t packetSequence = 0;
+uint8_t packetBuf[sizeof(PacketHeader) + SAMPLES_PER_PACKET * sizeof(Sample)];
+
+IntervalTimer sampleTimer;
+Encoder wheelEncoder(WHEEL_ENCODER_A_PIN, WHEEL_ENCODER_B_PIN);
+
+float latestCurrent = 0.0f;
+float latestVoltage = 0.0f;
 float currentScale = 0.12f;
 float voltageScale = 0.12f;
 
 // ============================================================================
-// DRIVE STATE
+// SLOW TIMERS (main loop)
 // ============================================================================
-float targetEffort = 0.0f;             // Latest commanded effort [-1.0, +1.0]
-float currentEffort = 0.0f;            // Effort actually being output (ramped)
-unsigned long lastCommandMillis = 0;   // millis() of last valid command
-bool commandTimedOut = true;           // true until the first command arrives
-unsigned long lastControlMicros = 0;
-
-// ============================================================================
-// ENCODER STATE
-// ============================================================================
-Encoder wheelEncoder(WHEEL_ENCODER_A_PIN, WHEEL_ENCODER_B_PIN);
-int32_t lastSampleCount = 0;
-unsigned long lastSampleMicros = 0;
-
-// ============================================================================
-// DEFINE TIMER VARIABLES AND OBJECTS
-// ============================================================================
-const unsigned int controlTimerPeriod = 10;    // ms - ramp + PWM update (100 Hz)
-const unsigned int publishTimerPeriod = 200;   // ms - sample encoder + publish (5 Hz)
-const unsigned int analogTimerPeriod  = 100;   // ms
-const unsigned int debugTimerPeriod   = 500;   // ms - Serial Monitor printout
-TimerEvent controlTimer;
-TimerEvent publishTimer;
+const unsigned int analogTimerPeriod = 100;    // ms
+const unsigned int debugTimerPeriod  = 500;    // ms - Serial Monitor printout
 TimerEvent analogTimer;
 TimerEvent debugTimer;
 
 // ============================================================================
-// APPLY EFFORT - writes direction + PWM to the controller
+// APPLY EFFORT - writes direction + PWM to the controller (called from ISR)
 // ============================================================================
 void applyEffort(float effort) {
+  static int lastPwm = -1;
+  static int lastDir = -1;
+
   // DIR only changes when effort is nonzero, so it never toggles while idle.
   // HIGH on an open-drain pin = released (forward); LOW = pulled to GND (reverse).
+  int dir = lastDir;
   if (effort > 0.0f) {
-    digitalWrite(DIRECTION_PIN, HIGH);
+    dir = HIGH;
   } else if (effort < 0.0f) {
-    digitalWrite(DIRECTION_PIN, LOW);
+    dir = LOW;
+  }
+  if (dir != lastDir && dir != -1) {
+    digitalWrite(DIRECTION_PIN, dir);
+    lastDir = dir;
   }
 
   float magnitude = fabsf(effort);
   if (magnitude > 1.0f) magnitude = 1.0f;
-  analogWrite(PWM_PIN, (int)(magnitude * PWM_MAX + 0.5f));
+  int pwm = (int)(magnitude * PWM_MAX + 0.5f);
+  if (pwm != lastPwm) {
+    analogWrite(PWM_PIN, pwm);
+    lastPwm = pwm;
+  }
 }
 
 // ============================================================================
 // RAMP - move currentEffort toward targetEffort at the configured rates
 // ============================================================================
 void rampTowardTarget(float dt) {
-  float diff = targetEffort - currentEffort;
+  float cur = currentEffort;
+  float diff = targetEffort - cur;
   if (diff == 0.0f) return;
 
   // |effort| is increasing if we're starting from zero or moving away from it
-  bool increasing = (currentEffort == 0.0f) || ((currentEffort > 0.0f) == (diff > 0.0f));
+  bool increasing = (cur == 0.0f) || ((cur > 0.0f) == (diff > 0.0f));
   float maxStep = (increasing ? RAMP_UP_PER_S : RAMP_DOWN_PER_S) * dt;
-  float next = currentEffort + constrain(diff, -maxStep, maxStep);
+  float next = cur + constrain(diff, -maxStep, maxStep);
 
   // On a direction change, stop at exactly zero for one tick so the new
   // direction starts from zero at the ramp-up rate.
-  if ((currentEffort > 0.0f && next < 0.0f) || (currentEffort < 0.0f && next > 0.0f)) {
+  if ((cur > 0.0f && next < 0.0f) || (cur < 0.0f && next > 0.0f)) {
     next = 0.0f;
   }
   currentEffort = next;
 }
 
 // ============================================================================
-// CONTROL TIMER CALLBACK (100 Hz) - watchdog, ramp, PWM output
+// 1 kHz ISR - control update, then encoder sample. Keep this short.
 // ============================================================================
-void controlTimerCallback() {
-  unsigned long now = micros();
-  float dt = (now - lastControlMicros) * 1e-6f;
-  lastControlMicros = now;
-  if (dt > 0.1f) dt = 0.1f;  // don't jump the ramp after a stall
-
+void sampleISR() {
   // Command watchdog: if the PC stops sending, ramp to zero
   if (!commandTimedOut && (millis() - lastCommandMillis > COMMAND_TIMEOUT_MS)) {
     commandTimedOut = true;
     targetEffort = 0.0f;
-    Serial.println("! Command timeout - target set to 0");
+    timeoutEvent = true;
   }
-
-  rampTowardTarget(dt);
+  rampTowardTarget(SAMPLE_PERIOD_US * 1e-6f);
   applyEffort(currentEffort);
+
+  // Sample into the ring buffer (drop + count if the loop hasn't kept up)
+  uint32_t head = ringHead;
+  if (head - ringTail >= RING_SIZE) {
+    droppedSamples = droppedSamples + 1;
+    return;
+  }
+  Sample &s = ring[head & (RING_SIZE - 1)];
+  s.timeStamp = micros();
+  s.encoderCount = ENCODER_SIGN * wheelEncoder.read();
+  s.effort = currentEffort;
+  __sync_synchronize();          // sample fully written before it's published
+  ringHead = head + 1;
 }
 
 // ============================================================================
@@ -196,10 +242,14 @@ void onMessageReceived(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  targetEffort = constrain(effort, -1.0f, 1.0f);
+  noInterrupts();
   lastCommandMillis = millis();
-  if (commandTimedOut) {
-    commandTimedOut = false;
+  targetEffort = constrain(effort, -1.0f, 1.0f);
+  bool wasTimedOut = commandTimedOut;
+  commandTimedOut = false;
+  interrupts();
+
+  if (wasTimedOut) {
     Serial.println("> Receiving commands");
   }
 }
@@ -211,53 +261,68 @@ EthernetClient ethClient;
 PubSubClient client(brokerIP, brokerPort, onMessageReceived, ethClient);
 
 // ============================================================================
-// PUBLISH TIMER CALLBACK - sample encoder and publish 24-byte state packet
+// PUBLISH - send every full batch of samples waiting in the ring buffer
 // ============================================================================
-void publishTimerCallback() {
-  // Sample encoder and timestamp together so they line up
-  unsigned long now = micros();
-  int32_t count = ENCODER_SIGN * wheelEncoder.read();
+void publishPendingSamples() {
+  while (ringHead - ringTail >= SAMPLES_PER_PACKET) {
+    __sync_synchronize();        // see the samples the ISR finished writing
 
-  float dt = (now - lastSampleMicros) * 1e-6f;
-  if (dt > 0.0f) {
-    // Unsigned subtraction keeps the delta right even if the count wraps
-    int32_t delta = (int32_t)((uint32_t)count - (uint32_t)lastSampleCount);
-    motorState.velocity = delta * RAD_PER_COUNT / dt;
+    PacketHeader header;
+    header.version = PACKET_VERSION;
+    header.sampleCount = SAMPLES_PER_PACKET;
+    header.sequence = packetSequence++;
+    header.droppedSamples = droppedSamples;
+    header.current = latestCurrent;
+    header.voltage = latestVoltage;
+    memcpy(packetBuf, &header, sizeof(header));
+
+    uint32_t tail = ringTail;
+    for (uint16_t i = 0; i < SAMPLES_PER_PACKET; i++) {
+      memcpy(packetBuf + sizeof(header) + i * sizeof(Sample),
+             &ring[(tail + i) & (RING_SIZE - 1)], sizeof(Sample));
+    }
+    __sync_synchronize();        // done reading before handing the slots back
+    ringTail = tail + SAMPLES_PER_PACKET;
+
+    // If this fails (e.g. disconnected) the packet is lost; the PC sees the
+    // sequence gap.
+    client.publish(stateTopic, packetBuf, sizeof(packetBuf), false);
   }
-  lastSampleCount = count;
-  lastSampleMicros = now;
-
-  motorState.timeStamp = now;
-  motorState.encoderCount = count;
-  motorState.effortCommand = currentEffort;
-
-  byte payload[sizeof(MotorState)];
-  memcpy(payload, &motorState, sizeof(MotorState));
-  client.publish(stateTopic, payload, sizeof(MotorState), false);
 }
 
 // ============================================================================
 // ANALOG TIMER CALLBACK TO READ VOLTAGE AND CURRENT
 // ============================================================================
 void analogTimerCallback() {
-  motorState.current = currentScale * analogRead(CURRENT_SENSOR_PIN);
-  motorState.voltage = voltageScale * analogRead(VOLTAGE_SENSOR_PIN);
+  latestCurrent = currentScale * analogRead(CURRENT_SENSOR_PIN);
+  latestVoltage = voltageScale * analogRead(VOLTAGE_SENSOR_PIN);
 }
 
 // ============================================================================
 // DEBUG TIMER CALLBACK - human-readable status on the Serial Monitor
 // ============================================================================
 void debugTimerCallback() {
-  if (!Serial) return;  // only print when the Serial Monitor is open
+  static int32_t lastCount = 0;
+  static uint32_t lastMicros = 0;
 
-  long count = ENCODER_SIGN * wheelEncoder.read();
-  float rpm = motorState.velocity * 60.0f / (2.0f * PI);
-  Serial.printf("enc=%ld (A=%d B=%d) rev=%.2f rpm=%.0f | target=%+.2f out=%+.2f | mqtt=%s\n",
-                count,
+  int32_t count = ENCODER_SIGN * wheelEncoder.read();
+  uint32_t now = micros();
+  float rpm = 0.0f;
+  if (lastMicros != 0) {
+    rpm = (count - lastCount) / COUNTS_PER_REV * 60.0f / ((now - lastMicros) * 1e-6f);
+  }
+  lastCount = count;
+  lastMicros = now;
+
+  if (!Serial) return;  // only print when the Serial Monitor is open
+  Serial.printf("enc=%ld (A=%d B=%d) rev=%.2f rpm=%.0f | target=%+.2f out=%+.2f | "
+                "mqtt=%s pkts=%lu dropped=%lu\n",
+                (long)count,
                 digitalRead(WHEEL_ENCODER_A_PIN), digitalRead(WHEEL_ENCODER_B_PIN),
                 count / COUNTS_PER_REV, rpm,
-                targetEffort, currentEffort,
-                client.connected() ? "up" : "DOWN");
+                (float)targetEffort, (float)currentEffort,
+                client.connected() ? "up" : "DOWN",
+                (unsigned long)packetSequence, (unsigned long)droppedSamples);
 }
 
 // ============================================================================
@@ -313,6 +378,8 @@ void setup() {
 
   Serial.printf("\n=== Teensy 4.1 Motor Node %d ===\n", MOTOR_ID);
   Serial.printf("State topic:   %s\nCommand topic: %s\n", stateTopic, commandTopic);
+  Serial.printf("Sampling at %d Hz, %d samples/packet, packet version %d\n",
+                1000000 / SAMPLE_PERIOD_US, SAMPLES_PER_PACKET, PACKET_VERSION);
   Serial.println("Initializing Ethernet...");
 
   // Initialize Ethernet (DHCP)
@@ -323,42 +390,53 @@ void setup() {
     Serial.println("ERROR: Ethernet.begin() failed!");
   }
 
+  // Batched packets are bigger than PubSubClient's 256-byte default buffer
+  if (!client.setBufferSize(1024)) {
+    Serial.println("ERROR: could not allocate MQTT buffer!");
+  }
+
   // Connect to MQTT broker
   connectToBroker();
 
-  lastSampleCount = ENCODER_SIGN * wheelEncoder.read();
-  lastSampleMicros = micros();
-  lastControlMicros = micros();
-
-  controlTimer.set(controlTimerPeriod, controlTimerCallback);
-  publishTimer.set(publishTimerPeriod, publishTimerCallback);
   analogTimer.set(analogTimerPeriod, analogTimerCallback);
   debugTimer.set(debugTimerPeriod, debugTimerCallback);
+
+  // Start the 1 kHz control + sampling interrupt. Lower priority (higher
+  // number) than the encoder pin interrupts, so encoder edges are never held
+  // up by it.
+  sampleTimer.priority(192);
+  sampleTimer.begin(sampleISR, SAMPLE_PERIOD_US);
 }
 
 // ============================================================================
-// MAIN LOOP
+// MAIN LOOP - networking only; control + sampling run in sampleISR()
 // ============================================================================
 void loop() {
   // Maintain Ethernet connection
   Ethernet.maintain();
 
-  // If the broker link drops, cut the throttle immediately. Reconnecting can
-  // block for several seconds, and the ramp can't run during that time.
+  // If the broker link drops, cut the throttle immediately (the ISR applies
+  // it within 1 ms, and keeps running while connect() blocks).
   if (!client.connected()) {
+    noInterrupts();
     targetEffort = 0.0f;
     currentEffort = 0.0f;
-    applyEffort(0.0f);
     commandTimedOut = true;
+    interrupts();
     connectToBroker();
   }
 
   // Process incoming MQTT messages
   client.loop();
 
-  // Run timers
-  controlTimer.update();
-  publishTimer.update();
+  // Send any full batches of samples
+  publishPendingSamples();
+
+  if (timeoutEvent) {
+    timeoutEvent = false;
+    Serial.println("! Command timeout - target set to 0");
+  }
+
   analogTimer.update();
   debugTimer.update();
 }

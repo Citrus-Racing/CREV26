@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor Bench Control</title>
+<style>
+  :root {
+    --bg: #f3f4f6; --card: #ffffff; --text: #1b1e23; --muted: #667085; --border: #dde1e7;
+    --input: #ffffff; --grid: #e6e8ec; --subtle: #f6f7f9;
+    --rpm: #2563eb; --effort: #c2410c; --target: #98a2b3;
+    --ok: #15803d; --warn: #b45309; --bad: #dc2626; --off: #a0a7b4;
+    --deadband: rgba(194, 65, 12, 0.14);
+    --stop: #dc2626; --stop-hover: #b91c1c; --apply: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #181b21; --text: #e5e7eb; --muted: #98a1ae; --border: #2a2f38;
+      --input: #11141a; --grid: #252a32; --subtle: #1d2128;
+      --rpm: #60a5fa; --effort: #fb923c; --target: #6b7280;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --off: #5b6270;
+      --deadband: rgba(251, 146, 60, 0.16);
+      --stop: #dc2626; --stop-hover: #ef4444; --apply: #3b82f6;
+    }
+  }
+  [hidden] { display: none !important; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  }
+
+  /* ------------------------------------------------------------ header */
+  header { position: sticky; top: 0; z-index: 10; background: var(--card); border-bottom: 1px solid var(--border); }
+  .bar { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; padding: 10px 16px; }
+  .bar + .bar { border-top: 1px solid var(--border); padding-top: 8px; padding-bottom: 8px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+  .dot.ok { background: var(--ok); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  .spacer { flex: 1; }
+  .hint { font-size: 12px; color: var(--muted); }
+  #stopAll {
+    background: var(--stop); color: #fff; border: 0; border-radius: 8px;
+    padding: 10px 20px; font-size: 15px; font-weight: 750; letter-spacing: .03em; cursor: pointer;
+  }
+  #stopAll:hover { background: var(--stop-hover); }
+  .group { display: inline-flex; align-items: center; gap: 8px; }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; }
+  .seg button.active { background: var(--apply); border-color: var(--apply); color: #fff; position: relative; }
+  button.paused { background: var(--warn); border-color: var(--warn); color: #fff; }
+  #groupNotes { width: 260px; max-width: 100%; }
+  #toolbarMsg { font-size: 12px; color: var(--muted); }
+  #toolbarMsg.bad { color: var(--bad); }
+  #banner { display: none; padding: 8px 16px; background: var(--bad); color: #fff; font-weight: 600; }
+  #banner.show { display: block; }
+
+  /* ------------------------------------------------------------- cards */
+  main {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px;
+    padding: 16px; max-width: 1600px; margin: 0 auto;
+  }
+  @media (max-width: 920px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  }
+  .card.offline .live { opacity: .45; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+
+  .readouts { display: flex; align-items: flex-end; gap: 22px; flex-wrap: wrap; }
+  .rpm { font-size: 36px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; min-width: 6ch; }
+  .rpm small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  .kv { display: grid; grid-template-columns: auto auto; gap: 2px 10px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .kv b { color: var(--text); font-weight: 600; text-align: right; }
+
+  .elec {
+    display: flex; align-items: baseline; gap: 6px 18px; flex-wrap: wrap;
+    padding: 6px 10px; border: 1px dashed var(--border); border-radius: 8px;
+    font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .elec.wired { border-style: solid; }
+  .elec .elec-label { font-weight: 650; color: var(--text); }
+  .elec b { color: var(--text); font-weight: 600; }
+  .elec .tag { margin-left: auto; font-size: 11.5px; font-style: italic; }
+
+  canvas { width: 100%; height: 180px; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: -4px; }
+  .legend i { display: inline-block; width: 18px; height: 0; vertical-align: middle; margin-right: 5px; border-top: 2px solid; }
+  .legend .l-rpm { border-color: var(--rpm); }
+  .legend .l-eff { border-color: var(--effort); border-top-style: dashed; }
+  .legend .l-tgt { border-color: var(--target); }
+
+  .scale { position: relative; height: 10px; border-radius: 5px; background: var(--grid); margin: 4px 0 2px; }
+  .scale .db { position: absolute; top: 0; bottom: 0; background: var(--deadband); }
+  .scale .zero { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--muted); opacity: .6; }
+  .scale .mark { position: absolute; top: -4px; width: 4px; height: 18px; margin-left: -2px; border-radius: 2px; transition: left .1s linear; }
+  .scale .mark.target { background: var(--target); }
+  .scale .mark.out { background: var(--effort); }
+  .scale-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+
+  .cmd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .cmd input[type=range] { flex: 1; min-width: 140px; accent-color: var(--apply); }
+  input[type=number], input[type=text], select {
+    background: var(--input); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: inherit;
+  }
+  input[type=number] { width: 84px; font-variant-numeric: tabular-nums; }
+  input:disabled, select:disabled { opacity: .5; }
+  button {
+    background: var(--input); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.apply.pending { background: var(--apply); border-color: var(--apply); color: #fff; }
+  button.stop { color: var(--bad); }
+  button.recording { background: var(--bad); border-color: var(--bad); color: #fff; }
+
+  .test-run { border: 1px solid var(--apply); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; background: var(--subtle); }
+  .test-run.aborted { border-color: var(--warn); }
+  .test-line { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+  .test-line span { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .progress { height: 6px; border-radius: 3px; background: var(--grid); overflow: hidden; }
+  .progress div { height: 100%; width: 0; background: var(--apply); transition: width .1s linear; }
+  .test-run.aborted .progress div { background: var(--warn); }
+
+  .rec { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .rec input[type=text] { flex: 1; min-width: 140px; }
+  .rec-status { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; min-height: 1.4em; }
+
+  details.tests { border: 1px solid var(--border); border-radius: 8px; padding: 0 10px; }
+  details.tests summary { cursor: pointer; padding: 7px 0; font-weight: 600; font-size: 13px; }
+  .test-form { display: flex; flex-direction: column; gap: 8px; padding-bottom: 10px; }
+  .fields { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; }
+  .fields label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .test-preview { font-size: 12px; color: var(--muted); min-height: 1.4em; overflow-wrap: anywhere; }
+  .test-preview.bad { color: var(--bad); }
+  .test-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  .foot { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 8px; }
+  .foot b { color: var(--text); font-weight: 600; }
+  .err { color: var(--bad); font-size: 12px; overflow-wrap: anywhere; }
+  .err:empty { display: none; }
+
+  footer { max-width: 1600px; margin: 0 auto; padding: 0 16px 18px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>Motor Bench Control</h1>
+    <span class="pill"><span class="dot" id="serverDot"></span><span id="serverText">Connecting…</span></span>
+    <span class="pill"><span class="dot" id="brokerDot"></span><span id="brokerText">Broker —</span></span>
+    <span class="spacer"></span>
+    <span class="hint">Esc = stop all</span>
+    <button id="stopAll" title="Abort tests and set every motor to 0 (ramps down at the firmware rate)">STOP ALL</button>
+  </div>
+  <div class="bar">
+    <span class="group">
+      <span class="hint">Charts</span>
+      <span class="seg" id="windowSeg">
+        <button data-window="10">10 s</button>
+        <button data-window="30">30 s</button>
+        <button data-window="120">2 min</button>
+      </span>
+      <button id="pauseBtn" title="Freeze the charts (numbers keep updating)">Pause</button>
+    </span>
+    <span class="spacer"></span>
+    <span class="group">
+      <input type="text" id="groupNotes" maxlength="500" placeholder="Notes for Record all (optional)">
+      <button id="recordAll" title="Start/stop recording on every online motor at once">● Record all</button>
+    </span>
+    <span id="toolbarMsg"></span>
+  </div>
+</header>
+<div id="banner"></div>
+
+<main id="grid"></main>
+
+<footer>
+  Commands are sent only after you press Apply (or Enter). Stop and STOP ALL ramp the output down at the
+  firmware rate (0.25/s), so they are not instant; for an emergency use the HV killswitch.
+  If this page closes, the server aborts tests and stops the motors it was driving within about 1 s.
+  The shaded band on each effort strip is the controller's dead band (motor 1 measured: starts at about ±0.42).
+</footer>
+
+<template id="cardTpl">
+  <section class="card offline">
+    <div class="card-head">
+      <h2 data-r="title">Motor</h2>
+      <span class="pill"><span class="dot" data-r="dot"></span><span data-r="status">No data</span></span>
+    </div>
+    <div class="readouts live">
+      <div class="rpm"><span data-r="rpm">—</span><small>rpm</small></div>
+      <div class="kv">
+        <span>output</span><b data-r="out">—</b>
+        <span>target</span><b data-r="target">0.00</b>
+      </div>
+      <div class="kv">
+        <span>rev</span><b data-r="rev">—</b>
+        <span>count</span><b data-r="count">—</b>
+      </div>
+    </div>
+    <div class="elec live" data-r="elec" title="Current/voltage sensors. Enable per motor with POWER_SENSORS in control_panel.py once wired and calibrated.">
+      <span class="elec-label">Electrical</span>
+      <span>voltage <b data-r="volt">—</b></span>
+      <span>current <b data-r="amps">—</b></span>
+      <span>power <b data-r="watts">—</b></span>
+      <span class="tag" data-r="elecNote">sensors not wired</span>
+    </div>
+    <canvas class="live" data-r="chart"></canvas>
+    <div class="legend">
+      <span><i class="l-rpm"></i>speed (rpm, left)</span>
+      <span><i class="l-eff"></i>output effort (right)</span>
+      <span><i class="l-tgt"></i>target (right)</span>
+    </div>
+    <div>
+      <div class="scale" title="Effort -1 to +1. Shaded: dead band where the motor won't start. Grey: target. Orange: actual output (ramping).">
+        <div class="db" data-r="db"></div>
+        <div class="zero"></div>
+        <div class="mark target" data-r="mTarget"></div>
+        <div class="mark out" data-r="mOut"></div>
+      </div>
+      <div class="scale-labels"><span>−1 reverse</span><span>0</span><span>forward +1</span></div>
+    </div>
+    <div class="cmd">
+      <input type="range" min="-1" max="1" step="0.01" value="0" data-r="slider" aria-label="Effort">
+      <input type="number" min="-1" max="1" step="0.01" value="0.00" data-r="num" aria-label="Effort value">
+      <button class="apply" data-r="apply" title="Send this effort (or press Enter in the box)">Apply</button>
+      <button class="stop" data-r="stop" title="Set this motor to 0 (also aborts a running test)">Stop</button>
+    </div>
+    <div class="err" data-r="cmdErr"></div>
+
+    <div class="test-run" data-r="testRun" hidden>
+      <div class="test-line"><b data-r="testDesc"></b><span data-r="testTime"></span></div>
+      <div class="progress"><div data-r="testBar"></div></div>
+      <div class="test-line"><span data-r="testMsg"></span><button data-r="testAbort">Abort test</button></div>
+    </div>
+
+    <div class="rec">
+      <button data-r="rec">● Record</button>
+      <input type="text" maxlength="500" placeholder="Notes for recordings and tests (optional)" data-r="notes">
+    </div>
+    <div class="rec-status" data-r="recStatus">Not recording</div>
+
+    <details class="tests" data-r="testBox">
+      <summary>Run a test</summary>
+      <div class="test-form">
+        <div class="fields">
+          <label>test
+            <select data-r="testKind">
+              <option value="step">Step</option>
+              <option value="sweep">Sweep</option>
+            </select>
+          </label>
+        </div>
+        <div class="fields" data-r="stepFields">
+          <label>effort <input type="number" min="-1" max="1" step="0.05" value="0.60" data-r="stepEffort"></label>
+          <label>duration (s) <input type="number" min="0.5" step="0.5" value="10" data-r="stepDuration"></label>
+        </div>
+        <div class="fields" data-r="sweepFields" hidden>
+          <label>max effort <input type="number" min="0.05" max="1" step="0.05" value="1.00" data-r="sweepMax"></label>
+          <label>ramp (s) <input type="number" min="1" step="1" value="30" data-r="sweepRamp"></label>
+          <label>hold (s) <input type="number" min="0" step="1" value="2" data-r="sweepHold"></label>
+          <label>direction
+            <select data-r="sweepDir">
+              <option value="both">both</option>
+              <option value="forward">forward</option>
+              <option value="reverse">reverse</option>
+            </select>
+          </label>
+        </div>
+        <div class="test-preview" data-r="testPreview"></div>
+        <div class="test-actions">
+          <span class="hint">Records its own CSV, with the notes above.</span>
+          <button class="apply pending" data-r="testStart">Start test…</button>
+        </div>
+      </div>
+    </details>
+
+    <div class="foot">
+      <span>lost packets <b data-r="lost">0</b></span>
+      <span>Teensy-dropped samples <b data-r="dropped">0</b></span>
+    </div>
+    <div class="err" data-r="err"></div>
+  </section>
+</template>
+
+<script>
+'use strict';
+
+const MOTOR_IDS = [1, 2, 3, 4];
+const WINDOWS = [10, 30, 120];   // chart window choices (s)
+const MAX_WINDOW_S = 120;
+const DEADBAND = 0.42;           // controller start threshold, motor 1 measured 2026-11-02
+const GAP_S = 0.5;               // break chart lines across gaps longer than this
+
+const cards = {};
+let colors = {};
+let lastNow = 0;
+let windowS = 30;
+let paused = false;
+let pausedAt = 0;
+let toolbarTimer = null;
+
+try {
+  const saved = Number(localStorage.getItem('chartWindow'));
+  if (WINDOWS.includes(saved)) windowS = saved;
+} catch (e) { /* storage unavailable: use the default */ }
+
+// ---------------------------------------------------------------- helpers
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+function readColors() {
+  colors = {
+    grid: cssVar('--grid'), muted: cssVar('--muted'), warn: cssVar('--warn'),
+    rpm: cssVar('--rpm'), effort: cssVar('--effort'), target: cssVar('--target'),
+  };
+}
+function fmtSigned(x, digits) {
+  let v = Number(Number(x).toFixed(digits));
+  if (v === 0) v = 0;                       // no "-0"
+  return (v > 0 ? '+' : '') + v.toFixed(digits);
+}
+function fmtDuration(s) {
+  s = Math.max(0, Math.round(s || 0));
+  const m = Math.floor(s / 60);
+  return m + ':' + String(s % 60).padStart(2, '0');
+}
+function clampEffort(value) {
+  if (value === '' || value === null) return null;
+  const x = Number(value);
+  if (!Number.isFinite(x)) return null;
+  return Math.max(-1, Math.min(1, x));
+}
+function setDot(el, cls) {
+  el.className = 'dot' + (cls ? ' ' + cls : '');
+}
+function showBanner(text) {
+  const b = document.getElementById('banner');
+  b.textContent = text;
+  b.classList.toggle('show', !!text);
+}
+function setToolbarMsg(text, bad) {
+  const el = document.getElementById('toolbarMsg');
+  el.textContent = text;
+  el.classList.toggle('bad', !!bad);
+  clearTimeout(toolbarTimer);
+  toolbarTimer = setTimeout(() => { el.textContent = ''; }, 6000);
+}
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch (e) { /* no JSON body */ }
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+// ------------------------------------------------------------------ cards
+function buildCards() {
+  const tpl = document.getElementById('cardTpl');
+  const grid = document.getElementById('grid');
+  for (const id of MOTOR_IDS) {
+    const node = tpl.content.firstElementChild.cloneNode(true);
+    const r = {};
+    node.querySelectorAll('[data-r]').forEach(el => { r[el.dataset.r] = el; });
+    r.title.textContent = 'Motor ' + id;
+    r.db.style.left = ((1 - DEADBAND) * 50) + '%';
+    r.db.style.right = ((1 - DEADBAND) * 50) + '%';
+
+    const c = {
+      id, node, r, points: [], applied: 0,
+      recState: 'idle', recOwner: null, testing: false, dismissed: false, previewTimer: null,
+    };
+
+    r.slider.addEventListener('input', () => {
+      r.num.value = Number(r.slider.value).toFixed(2);
+      markPending(c);
+    });
+    r.num.addEventListener('input', () => {
+      const v = clampEffort(r.num.value);
+      if (v !== null) r.slider.value = v;
+      markPending(c);
+    });
+    r.num.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); apply(c); }
+    });
+    r.apply.addEventListener('click', () => apply(c));
+    r.stop.addEventListener('click', () => stopMotor(c));
+    r.rec.addEventListener('click', () => toggleRecord(c));
+
+    r.testKind.addEventListener('change', () => {
+      r.stepFields.hidden = r.testKind.value !== 'step';
+      r.sweepFields.hidden = r.testKind.value !== 'sweep';
+      schedulePreview(c);
+    });
+    for (const el of [r.stepEffort, r.stepDuration, r.sweepMax, r.sweepRamp, r.sweepHold, r.sweepDir]) {
+      el.addEventListener('input', () => schedulePreview(c));
+    }
+    r.testBox.addEventListener('toggle', () => { if (r.testBox.open) previewTest(c); });
+    r.testStart.addEventListener('click', () => startTest(c));
+    r.testAbort.addEventListener('click', () => {
+      if (c.testing) stopMotor(c);
+      else { c.dismissed = true; r.testRun.hidden = true; }
+    });
+
+    grid.appendChild(node);
+    cards[id] = c;
+  }
+}
+
+function staged(c) {
+  return clampEffort(c.r.num.value);
+}
+function markPending(c) {
+  const s = staged(c);
+  c.r.apply.classList.toggle('pending', !c.testing && s !== null && Math.abs(s - c.applied) > 1e-9);
+}
+function resetInputs(c) {
+  c.r.num.value = '0.00';
+  c.r.slider.value = 0;
+}
+
+async function apply(c) {
+  const v = staged(c);
+  if (v === null) {
+    c.r.cmdErr.textContent = 'Enter a number between -1 and 1.';
+    return;
+  }
+  c.r.num.value = v.toFixed(2);
+  c.r.slider.value = v;
+  try {
+    await post('/api/command', { motor: c.id, effort: v });
+    c.r.cmdErr.textContent = '';
+  } catch (e) {
+    c.r.cmdErr.textContent = 'Command failed: ' + e.message;
+  }
+}
+
+async function stopMotor(c) {
+  resetInputs(c);
+  try {
+    await post('/api/stop', { motor: c.id });
+    c.r.cmdErr.textContent = '';
+  } catch (e) {
+    c.r.cmdErr.textContent = 'Stop failed: ' + e.message;
+  }
+}
+
+async function stopAll() {
+  for (const c of Object.values(cards)) resetInputs(c);
+  try {
+    await post('/api/stop', {});
+  } catch (e) {
+    showBanner('STOP ALL failed: ' + e.message + '. Use the HV killswitch if a motor is still running.');
+  }
+}
+
+async function toggleRecord(c) {
+  const action = c.recState === 'recording' ? 'stop' : 'start';
+  try {
+    await post('/api/record', { motor: c.id, action, notes: c.r.notes.value });
+  } catch (e) {
+    c.r.recStatus.textContent = 'Could not ' + action + ' recording: ' + e.message;
+  }
+}
+
+// ------------------------------------------------------------------ tests
+function testRequest(c) {
+  const r = c.r;
+  if (r.testKind.value === 'step') {
+    return { kind: 'step', params: { effort: Number(r.stepEffort.value), duration: Number(r.stepDuration.value) } };
+  }
+  return {
+    kind: 'sweep',
+    params: {
+      max_effort: Number(r.sweepMax.value), ramp_time: Number(r.sweepRamp.value),
+      hold: Number(r.sweepHold.value), direction: r.sweepDir.value,
+    },
+  };
+}
+
+function schedulePreview(c) {
+  clearTimeout(c.previewTimer);
+  c.previewTimer = setTimeout(() => previewTest(c), 250);
+}
+
+async function previewTest(c) {
+  const req = testRequest(c);
+  try {
+    const res = await post('/api/test', { action: 'preview', motor: c.id, kind: req.kind, params: req.params });
+    let text = res.description + ' · total ' + fmtDuration(res.duration_s);
+    if (res.warnings.length) text += ' · ⚠ ' + res.warnings.join('; ');
+    c.r.testPreview.textContent = text;
+    c.r.testPreview.classList.remove('bad');
+    return res;
+  } catch (e) {
+    c.r.testPreview.textContent = e.message;
+    c.r.testPreview.classList.add('bad');
+    return null;
+  }
+}
+
+async function startTest(c) {
+  const preview = await previewTest(c);
+  if (!preview) return;
+  const lines = ['Start this test on motor ' + c.id + '?', '', preview.description,
+                 'Total time: ' + fmtDuration(preview.duration_s)];
+  for (const w of preview.warnings) lines.push('⚠ ' + w);
+  lines.push('', 'The motor runs automatically and records its own CSV.',
+             'Stop, STOP ALL or Esc aborts it.');
+  if (!window.confirm(lines.join('\n'))) return;
+
+  const req = testRequest(c);
+  try {
+    await post('/api/test', { action: 'start', motor: c.id, kind: req.kind, params: req.params, notes: c.r.notes.value });
+    resetInputs(c);
+    c.dismissed = false;
+  } catch (e) {
+    c.r.testPreview.textContent = 'Could not start: ' + e.message;
+    c.r.testPreview.classList.add('bad');
+  }
+}
+
+// -------------------------------------------------------------- updating
+function recText(rec) {
+  switch (rec.state) {
+    case 'recording':
+      return (rec.owner === 'test' ? 'Test recording ' : 'Recording ') + fmtDuration(rec.duration_s) + ' · ' +
+             (rec.samples || 0).toLocaleString() + ' samples → ' + rec.file;
+    case 'saving':
+      return 'Saving ' + rec.file + ' …';
+    case 'saved':
+      return 'Saved ' + rec.file + ' (' + (rec.samples || 0).toLocaleString() + ' samples, ' +
+             rec.duration_s + ' s, lost packets ' + rec.packets_lost +
+             ', Teensy-dropped ' + rec.teensy_dropped_samples + ')';
+    case 'error':
+      return 'Recording error: ' + rec.message;
+    default:
+      return 'Not recording';
+  }
+}
+
+function updateCard(c, m) {
+  const r = c.r;
+  c.applied = m.target;
+
+  let status = 'No data', dot = '';
+  if (m.error) { status = 'Bad packets'; dot = 'warn'; }
+  else if (m.online) { status = 'Online · ' + m.age_ms + ' ms'; dot = 'ok'; }
+  else if (m.seen) { status = 'Offline'; dot = 'bad'; }
+  r.status.textContent = status;
+  setDot(r.dot, dot);
+  c.node.classList.toggle('offline', !m.online);
+
+  if (m.seen) {
+    r.rpm.textContent = fmtSigned(m.rpm, 0);
+    r.out.textContent = fmtSigned(m.effort_out, 2);
+    r.rev.textContent = m.rev.toFixed(2);
+    r.count.textContent = m.count.toLocaleString();
+  }
+  r.target.textContent = fmtSigned(m.target, 2);
+
+  const el = m.electrical || { wired: false };
+  const showElec = el.wired && m.online && el.voltage !== null && el.current !== null;
+  r.elec.classList.toggle('wired', !!el.wired);
+  if (showElec) {
+    r.volt.textContent = el.voltage.toFixed(1) + ' V';
+    r.amps.textContent = fmtSigned(el.current, 1) + ' A';
+    r.watts.textContent = fmtSigned(el.voltage * el.current, 0) + ' W';
+    r.elecNote.textContent = '';
+  } else {
+    r.volt.textContent = r.amps.textContent = r.watts.textContent = '—';
+    r.elecNote.textContent = el.wired ? 'no data' : 'sensors not wired';
+  }
+
+  r.lost.textContent = m.lost;
+  r.dropped.textContent = m.dropped;
+  r.err.textContent = m.error || '';
+  r.mTarget.style.left = ((m.target + 1) * 50) + '%';
+  r.mOut.style.left = ((m.effort_out + 1) * 50) + '%';
+
+  // Test progress
+  const test = m.test || { state: 'idle' };
+  c.testing = test.state === 'running';
+  if (c.testing) c.dismissed = false;
+  r.testRun.hidden = test.state === 'idle' || c.dismissed;
+  if (test.state !== 'idle') {
+    const frac = test.duration_s ? Math.min(1, (test.elapsed_s || 0) / test.duration_s) : 0;
+    r.testDesc.textContent = test.description || '';
+    r.testBar.style.width = (frac * 100).toFixed(1) + '%';
+    r.testRun.classList.toggle('aborted', test.state === 'aborted');
+    r.testTime.textContent = fmtDuration(test.elapsed_s) + ' / ' + fmtDuration(test.duration_s) +
+                             (c.testing ? ' · cmd ' + fmtSigned(test.command || 0, 2) : '');
+    if (c.testing) r.testMsg.textContent = 'Running…';
+    else if (test.state === 'done') r.testMsg.textContent = 'Test complete';
+    else r.testMsg.textContent = 'Aborted: ' + (test.message || '');
+    r.testAbort.textContent = c.testing ? 'Abort test' : 'Dismiss';
+    r.testAbort.classList.toggle('stop', c.testing);
+  }
+
+  // Recording
+  const rec = m.record || { state: 'idle' };
+  c.recState = rec.state;
+  c.recOwner = rec.owner || null;
+  const recording = rec.state === 'recording';
+  r.rec.textContent = recording ? '■ Stop recording' : '● Record';
+  r.rec.classList.toggle('recording', recording);
+  r.rec.disabled = rec.state === 'saving' || c.testing;
+  r.notes.disabled = recording || rec.state === 'saving' || c.testing;
+  r.recStatus.textContent = recText(rec);
+
+  // A running test owns the motor: lock the manual controls
+  for (const ctl of [r.slider, r.num, r.apply, r.testStart]) ctl.disabled = c.testing;
+  markPending(c);
+}
+
+function updateToolbar() {
+  for (const b of document.querySelectorAll('#windowSeg button')) {
+    b.classList.toggle('active', Number(b.dataset.window) === windowS);
+  }
+  const pb = document.getElementById('pauseBtn');
+  pb.textContent = paused ? 'Resume' : 'Pause';
+  pb.classList.toggle('paused', paused);
+
+  const anyManual = Object.values(cards).some(c => c.recState === 'recording' && c.recOwner === 'manual');
+  const ra = document.getElementById('recordAll');
+  ra.textContent = anyManual ? '■ Stop all recordings' : '● Record all';
+  ra.classList.toggle('recording', anyManual);
+}
+
+async function recordAll() {
+  const anyManual = Object.values(cards).some(c => c.recState === 'recording' && c.recOwner === 'manual');
+  const action = anyManual ? 'stop' : 'start';
+  try {
+    const res = await post('/api/record_all', { action, notes: document.getElementById('groupNotes').value });
+    const list = (res.motors || []).join(', ') || 'none';
+    setToolbarMsg(action === 'start' ? 'Recording motors ' + list : 'Stopped recordings on motors ' + list);
+  } catch (e) {
+    setToolbarMsg('Record all: ' + e.message, true);
+  }
+}
+
+// ------------------------------------------------------------------ chart
+function niceCeil(v) {
+  for (const s of [500, 1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]) {
+    if (v <= s) return s;
+  }
+  return Math.ceil(v / 2000) * 2000;
+}
+
+function strokeSeries(ctx, pts, fx, fy, color, dash, width, step) {
+  if (pts.length < 2) return;
+  ctx.strokeStyle = color;
+  ctx.setLineDash(dash);
+  ctx.lineWidth = width;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  let prevT = null, prevY = 0;
+  for (const p of pts) {
+    const xx = fx(p), yy = fy(p);
+    if (prevT === null || p[0] - prevT > GAP_S) {
+      ctx.moveTo(xx, yy);
+    } else {
+      if (step) ctx.lineTo(xx, prevY);
+      ctx.lineTo(xx, yy);
+    }
+    prevT = p[0];
+    prevY = yy;
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function chartNow() {
+  return paused ? pausedAt : lastNow;
+}
+
+function drawChart(c, now) {
+  const cv = c.r.chart;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const padL = 46, padR = 36, padT = 8, padB = 18;
+  const pw = w - padL - padR, ph = h - padT - padB;
+
+  // Only the points in view set the scale, and very dense views are thinned
+  let visible = c.points.filter(p => p[0] >= now - windowS - 0.2 && p[0] <= now + 0.2);
+  const stride = Math.ceil(visible.length / Math.max(1, pw * 2));
+  if (stride > 1) visible = visible.filter((p, i) => i % stride === 0 || i === visible.length - 1);
+
+  // Symmetric axes so 0 rpm and 0 effort share the centre line
+  let maxAbs = 0;
+  for (const p of visible) maxAbs = Math.max(maxAbs, Math.abs(p[1]));
+  const R = niceCeil(Math.max(maxAbs * 1.1, 500));
+  const x = t => padL + (1 - (now - t) / windowS) * pw;
+  const yRpm = v => padT + (1 - (v + R) / (2 * R)) * ph;
+  const yEff = e => padT + (1 - (e + 1) / 2) * ph;
+
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.lineWidth = 1;
+  for (const f of [-1, -0.5, 0, 0.5, 1]) {
+    const yy = Math.round(padT + (1 - (f + 1) / 2) * ph) + 0.5;
+    ctx.strokeStyle = colors.grid;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + pw, yy); ctx.stroke();
+    ctx.fillStyle = colors.muted;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'right'; ctx.fillText(String(Math.round(f * R)), padL - 6, yy);
+    ctx.textAlign = 'left';  ctx.fillText(f.toFixed(1), padL + pw + 6, yy);
+  }
+  const tick = windowS <= 10 ? 5 : windowS <= 30 ? 10 : 30;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  for (let s = windowS; s >= 0; s -= tick) {
+    const label = s === 0 ? (paused ? 'paused' : 'now') : '−' + s + ' s';
+    ctx.fillText(label, x(now - s), padT + ph + 4);
+  }
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(padL, padT, pw, ph); ctx.clip();
+  strokeSeries(ctx, visible, p => x(p[0]), p => yEff(p[3]), colors.target, [], 1.5, true);
+  strokeSeries(ctx, visible, p => x(p[0]), p => yEff(p[2]), colors.effort, [6, 4], 1.5, false);
+  strokeSeries(ctx, visible, p => x(p[0]), p => yRpm(p[1]), colors.rpm, [], 2, false);
+  ctx.restore();
+
+  if (paused) {
+    ctx.fillStyle = colors.warn;
+    ctx.font = '600 11px system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'top';
+    ctx.fillText('PAUSED', padL + pw - 4, padT + 4);
+  }
+}
+
+function redrawAll() {
+  for (const c of Object.values(cards)) drawChart(c, chartNow());
+}
+
+// ---------------------------------------------------------------- updates
+function onSnapshot(s) {
+  lastNow = s.t;
+  setDot(document.getElementById('brokerDot'), s.broker ? 'ok' : 'bad');
+  document.getElementById('brokerText').textContent = s.broker ? 'Broker connected' : 'Broker DISCONNECTED';
+
+  // Keep enough history for the longest window (relative to the paused moment if paused)
+  const cutoff = (paused ? Math.min(pausedAt, s.t) : s.t) - MAX_WINDOW_S - 1;
+  for (const m of s.motors) {
+    const c = cards[m.id];
+    if (!c) continue;
+    for (const p of m.points) c.points.push(p);      // [t, rpm, effort_out, target]
+    let i = 0;
+    while (i < c.points.length && c.points[i][0] < cutoff) i++;
+    if (i) c.points.splice(0, i);
+    updateCard(c, m);
+    if (!paused) drawChart(c, s.t);
+  }
+  updateToolbar();
+}
+
+function connect() {
+  const es = new EventSource('/events');
+  es.onopen = () => {
+    setDot(document.getElementById('serverDot'), 'ok');
+    document.getElementById('serverText').textContent = 'Server connected';
+    showBanner('');
+  };
+  es.onmessage = ev => {
+    try {
+      onSnapshot(JSON.parse(ev.data));
+    } catch (e) {
+      console.error('Bad update from server', e);
+    }
+  };
+  es.onerror = () => {
+    setDot(document.getElementById('serverDot'), 'bad');
+    document.getElementById('serverText').textContent = 'Server disconnected';
+    showBanner('Lost connection to control_panel.py. Motors stop on their own within about 1 s. Reconnecting…');
+  };
+}
+
+// ------------------------------------------------------------------- init
+readColors();
+if (window.matchMedia) {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    readColors();
+    redrawAll();
+  });
+}
+window.addEventListener('resize', redrawAll);
+document.getElementById('stopAll').addEventListener('click', stopAll);
+document.getElementById('recordAll').addEventListener('click', recordAll);
+document.getElementById('pauseBtn').addEventListener('click', () => {
+  paused = !paused;
+  pausedAt = lastNow;
+  updateToolbar();
+  redrawAll();
+});
+document.getElementById('windowSeg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-window]');
+  if (!b) return;
+  windowS = Number(b.dataset.window);
+  try { localStorage.setItem('chartWindow', String(windowS)); } catch (err) { /* ignore */ }
+  updateToolbar();
+  redrawAll();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); stopAll(); }
+});
+buildCards();
+updateToolbar();
+connect();
+</script>
+</body>
+</html>

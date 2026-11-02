@@ -15,10 +15,11 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from mqtt_handler import MQTTHandler
-from data_manager import parse_motor_state
+from data_manager import parse_state_packet, ENCODER_COUNTS_PER_REV
 
 BROKER_IP = "192.168.10.1"
 BROKER_PORT = 1883
+PRINT_EVERY_N_PACKETS = 4   # packets arrive at 20 Hz -> print at 5 Hz
 
 
 def main():
@@ -27,16 +28,26 @@ def main():
     args = parser.parse_args()
     topic = f"robot/motor/{args.motor}/state"
 
+    stats = {"n": 0, "last_seq": None, "lost": 0}
+
     def on_state(msg):
         try:
-            ts_us, effort, _current, _voltage, count, pos, vel = parse_motor_state(msg.payload)
-        except Exception as e:
-            print(f"⚠ Bad packet ({len(msg.payload)} bytes): {e}")
+            pkt = parse_state_packet(msg.payload)
+        except ValueError as e:
+            print(f"⚠ {e}")
             return
-        rpm = vel * 60.0 / (2.0 * math.pi)
+        if stats["last_seq"] is not None:
+            stats["lost"] += max(0, pkt.sequence - stats["last_seq"] - 1)
+        stats["last_seq"] = pkt.sequence
+        stats["n"] += 1
+        if stats["n"] % PRINT_EVERY_N_PACKETS:
+            return
+
+        ts_us, count, effort = pkt.samples[-1]
+        rpm = pkt.velocity_rad_s() * 60.0 / (2.0 * math.pi)
         print(f"t={ts_us / 1e6:10.3f}s | effort={effort:+.3f} | "
-              f"count={count:+11d} ({pos / (2 * math.pi):+9.2f} rev) | "
-              f"vel={vel:+8.2f} rad/s ({rpm:+6.0f} rpm)")
+              f"count={count:+11d} ({count / ENCODER_COUNTS_PER_REV:+9.2f} rev) | "
+              f"{rpm:+7.0f} rpm | lost pkts={stats['lost']} dropped={pkt.dropped_samples}")
 
     mqtt_handler = MQTTHandler(BROKER_IP, BROKER_PORT)
     try:
