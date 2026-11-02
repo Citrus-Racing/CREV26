@@ -14,8 +14,8 @@ from data_manager import DataManager, parse_motor_state
 # Configuration
 BROKER_IP = "192.168.10.1"
 BROKER_PORT = 1883
-TOPIC_COMMAND = "robot/motor/1/command"
-TOPIC_STATE = "robot/motor/1/state"
+TOPIC_COMMAND_FMT = "robot/motor/{}/command"
+TOPIC_STATE_FMT = "robot/motor/{}/state"
 
 # Global state
 data_manager = DataManager()
@@ -58,9 +58,13 @@ def get_user_input() -> dict:
 def on_state_message(msg):
     """Callback when a state message arrives."""
     global start_time, on_duration, current_phase, message_count
-    
+
+    # Ignore packets that arrive after subscribing but before the test starts
+    if start_time is None:
+        return
+
     try:
-        timestamp_us, effort_command, current, voltage, position, velocity = parse_motor_state(msg.payload)
+        timestamp_us, effort_command, current, voltage, encoder_count, position, velocity = parse_motor_state(msg.payload)
         message_count += 1
         
         # Determine elapsed time and phase
@@ -73,7 +77,7 @@ def on_state_message(msg):
             command_effort = 0.0
         
         # Log the data (now includes effort_command from the Teensy)
-        data_manager.log_state(timestamp_us, effort_command, current, voltage, position, velocity)
+        data_manager.log_state(timestamp_us, effort_command, current, voltage, encoder_count, position, velocity)
         
         # Print progress
         print(f"[{message_count:04d}] Phase: {current_phase:3s} | "
@@ -87,7 +91,7 @@ def on_state_message(msg):
     except Exception as e:
         print(f"⚠ Error parsing message: {e}")
 
-def publish_effort_loop(mqtt_handler, effort, duration):
+def publish_effort_loop(mqtt_handler, topic_command, effort, duration):
     """Publish effort commands at 5 Hz for the specified duration (on-phase).
     Then publish 0.0 for the same duration (off-phase).
     """
@@ -117,7 +121,7 @@ def publish_effort_loop(mqtt_handler, effort, duration):
         
         # Publish at 5 Hz
         if time.time() >= next_publish:
-            mqtt_handler.publish_effort(TOPIC_COMMAND, command_effort)
+            mqtt_handler.publish_effort(topic_command, command_effort)
             next_publish += publish_interval
         
         time.sleep(0.01)  # Small sleep to prevent busy-waiting
@@ -130,7 +134,9 @@ def main():
     
     # Get user input
     params = get_user_input()
-    
+    topic_command = TOPIC_COMMAND_FMT.format(params["motor_id"])
+    topic_state = TOPIC_STATE_FMT.format(params["motor_id"])
+
     # Create MQTT handler
     mqtt_handler = MQTTHandler(BROKER_IP, BROKER_PORT)
     
@@ -149,19 +155,25 @@ def main():
         print(f"✓ Test file created: {filepath}\n")
         
         # Subscribe to state topic
-        mqtt_handler.subscribe(TOPIC_STATE, on_state_message)
-        
+        mqtt_handler.subscribe(topic_state, on_state_message)
+
         # Run the test (publish commands and collect data)
-        publish_effort_loop(mqtt_handler, params["effort"], params["duration"])
-        
-        # Write data to file
-        data_manager.write_file()
-        
+        publish_effort_loop(mqtt_handler, topic_command, params["effort"], params["duration"])
+
     except KeyboardInterrupt:
         print("\n\n✗ Test interrupted by user")
     except Exception as e:
         print(f"\n✗ Error: {e}")
     finally:
+        # Always tell the motor to stop, even after Ctrl-C or an error
+        if mqtt_handler.connected:
+            for _ in range(3):
+                mqtt_handler.publish_effort(topic_command, 0.0)
+                time.sleep(0.05)
+            print("✓ Sent stop command (effort 0.0)")
+        # Save whatever was collected, including partial runs
+        if data_manager.rows:
+            data_manager.write_file()
         mqtt_handler.disconnect()
         print("✓ Shutdown complete\n")
 

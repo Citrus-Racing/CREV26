@@ -55,8 +55,8 @@ class MQTTHandler:
         print(f"✓ Subscribed to: {topic}")
     
     def publish_effort(self, topic: str, effort: float):
-        """Publish a motor effort command (float)."""
-        payload = struct.pack('f', effort)
+        """Publish a motor effort command (little-endian float32, what the Teensy expects)."""
+        payload = struct.pack('<f', effort)
         self.client.publish(topic, payload)
     
     def disconnect(self):

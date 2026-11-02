@@ -3,7 +3,12 @@ import json
 import os
 from datetime import datetime
 from typing import Dict, List, Any
+import math
 import struct
+
+# Must match firmware: 600 P/R encoder, 4x decoding by the Encoder library
+ENCODER_COUNTS_PER_REV = 2400
+RAD_PER_COUNT = 2.0 * math.pi / ENCODER_COUNTS_PER_REV
 
 class DataManager:
     """Manages CSV file creation and data logging with embedded metadata."""
@@ -37,7 +42,8 @@ class DataManager:
             "effort_level": effort,
             "duration_seconds": duration,
             "publishing_frequency_hz": 5,
-            "teensy_ip": broker_ip,
+            "broker_ip": broker_ip,
+            "encoder_counts_per_rev": ENCODER_COUNTS_PER_REV,
             "notes": notes,
         }
         
@@ -45,13 +51,14 @@ class DataManager:
         return filepath
     
     def log_state(self, timestamp_us: int, effort_command: float, current: float, 
-                  voltage: float, position: float, velocity: float):
+                  voltage: float, encoder_count: int, position: float, velocity: float):
         """Log a motor state measurement."""
         self.rows.append({
             "timestamp_us": timestamp_us,
             "effort_command": effort_command,
             "current_A": current,
             "voltage_V": voltage,
+            "encoder_count": encoder_count,
             "position_rad": position,
             "velocity_rad_s": velocity,
         })
@@ -70,7 +77,8 @@ class DataManager:
             f.write("# DATA\n")
             
             # Write data rows
-            fieldnames = ["timestamp_us", "effort_command", "current_A", "voltage_V", "position_rad", "velocity_rad_s"]
+            fieldnames = ["timestamp_us", "effort_command", "current_A", "voltage_V",
+                          "encoder_count", "position_rad", "velocity_rad_s"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.rows)
@@ -91,13 +99,18 @@ def parse_motor_state(payload: bytes) -> tuple:
       float effortCommand          (4 bytes)  - f
       float current                (4 bytes)  - f
       float voltage                (4 bytes)  - f
-      float position               (4 bytes)  - f
+      int32_t encoderCount         (4 bytes)  - i
       float velocity               (4 bytes)  - f
-    
-    Returns: (timestamp_us, effort_command, current_A, voltage_V, position_rad, velocity_rad_s)
+
+    Returns: (timestamp_us, effort_command, current_A, voltage_V,
+              encoder_count, position_rad, velocity_rad_s)
+    position_rad is computed here from encoder_count in double precision.
     """
     if len(payload) != 24:
         raise ValueError(f"Expected 24 bytes, got {len(payload)}")
-    
-    return struct.unpack('Iffffff', payload)
+
+    # '<' = little-endian, no padding (matches the packed struct on the Teensy).
+    # uint32 + 3 floats + int32 + float = 24 bytes.
+    timestamp_us, effort, current, voltage, count, velocity = struct.unpack('<Ifffif', payload)
+    return timestamp_us, effort, current, voltage, count, count * RAD_PER_COUNT, velocity
 
