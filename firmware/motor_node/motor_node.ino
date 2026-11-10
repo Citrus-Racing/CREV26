@@ -8,11 +8,11 @@
 //     in batches (see STATE PACKET below)
 //
 // Timing: a 1 kHz hardware timer interrupt (sampleISR) does the control update
-// (watchdog, ramp, PWM) and takes the encoder sample. The main loop only
-// handles networking, so control and sampling keep running even while the
-// network is busy or reconnecting.
+// (watchdog, ramp, PWM) and takes the encoder sample. The main loop handles
+// networking and samples the current/voltage sensor pins, so control and
+// encoder sampling keep running even while the network is busy or reconnecting.
 //
-// To flash a different motor's board, change MOTOR_ID and check ENCODER_SIGN.
+// Each board is named after its wheel corner (LF, RF, LR, RR).
 // ============================================================================
 #include <NativeEthernet.h>
 #include <PubSubClient.h>
@@ -23,18 +23,25 @@
 // ============================================================================
 // PER-BOARD CONFIGURATION
 // ============================================================================
-#define MOTOR_ID 1   // 1-4. Sets the MQTT topics, MQTT client ID and MAC address.
+// @@BOARD_CONFIG_BEGIN@@
+// This file is the TEMPLATE for the four corner sketches; don't flash it.
+// After editing it, run:   python3 firmware/make_corner_sketches.py
+// which writes firmware/motor_node_<LF|RF|LR|RR>/ with this block filled in.
+// The per-corner values (MAC byte, ENCODER_SIGN) live in that script's table.
+#error "motor_node.ino is a template. Flash firmware/motor_node_<corner>/ instead (see make_corner_sketches.py)."
+#define MOTOR_NAME "XX"
+const uint8_t MAC_LAST_BYTE = 0;
+const long ENCODER_SIGN = 1;
+// @@BOARD_CONFIG_END@@
 
-#define STR_(x) #x
-#define STR(x) STR_(x)
-const char* stateTopic   = "robot/motor/" STR(MOTOR_ID) "/state";
-const char* commandTopic = "robot/motor/" STR(MOTOR_ID) "/command";
-const char* mqttClientId = "Teensy_Motor_" STR(MOTOR_ID);
+const char* stateTopic   = "robot/motor/" MOTOR_NAME "/state";
+const char* commandTopic = "robot/motor/" MOTOR_NAME "/command";
+const char* mqttClientId = "Teensy_Motor_" MOTOR_NAME;
 
 // ============================================================================
 // NETWORK CONFIGURATION
 // ============================================================================
-byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, MOTOR_ID};  // unique per board
+byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, MAC_LAST_BYTE};  // unique per board
 IPAddress brokerIP(192, 168, 10, 1);
 const uint16_t brokerPort = 1883;
 
@@ -43,8 +50,8 @@ const uint16_t brokerPort = 1883;
 // ============================================================================
 const uint8_t PWM_PIN = 23;              // PWM "throttle" output to motor controller
 const uint8_t DIRECTION_PIN = 22;        // Open-drain: released = forward, pulled to GND = reverse
-const uint8_t CURRENT_SENSOR_PIN = 21;   // Analog (not wired up yet)
-const uint8_t VOLTAGE_SENSOR_PIN = 20;   // Analog (not wired up yet)
+const uint8_t CURRENT_SENSOR_PIN = 21;   // Analog: current sensor output (LF: WCS1600 board)
+const uint8_t VOLTAGE_SENSOR_PIN = 20;   // Analog: bus voltage sensor (not wired up yet)
 const uint8_t WHEEL_ENCODER_A_PIN = 18;
 const uint8_t WHEEL_ENCODER_B_PIN = 17;
 
@@ -60,9 +67,8 @@ const uint8_t WHEEL_ENCODER_B_PIN = 17;
 // ============================================================================
 const float ENCODER_PPR    = 600.0f;
 const float COUNTS_PER_REV = 4.0f * ENCODER_PPR;            // 2400
-// Positive effort must read as positive velocity. Motor 1 needs -1 (verified
-// 2026-11-02). Check this on each new board and flip it if it's backwards.
-const long  ENCODER_SIGN   = -1;
+// ENCODER_SIGN (per board, set in the PER-BOARD CONFIGURATION block above):
+// positive effort must read as positive velocity.
 
 // ============================================================================
 // DRIVE CONFIGURATION
@@ -78,6 +84,19 @@ const uint32_t COMMAND_TIMEOUT_MS = 1000;  // no command for this long -> target
 const uint8_t PWM_MAX = 255;           // 8-bit analogWrite
 
 // ============================================================================
+// ANALOG SENSOR CONFIGURATION
+// ----------------------------------------------------------------------------
+// The current/voltage sensor pins are read at ~1 kHz in loop() and averaged
+// over each packet. The packet carries the raw pin voltages; the PC converts
+// them to amps and volts (utils/sensors.py), so calibrating needs no reflash.
+// Teensy 4.1 analog pins take 0-3.3 V only.
+// ============================================================================
+const uint8_t  ADC_BITS = 12;
+const float    ADC_VREF = 3.3f;
+const float    ADC_MAX  = 4095.0f;          // (1 << ADC_BITS) - 1
+const uint32_t ANALOG_PERIOD_US = 1000;
+
+// ============================================================================
 // SAMPLING CONFIGURATION
 // ============================================================================
 const int      SAMPLE_PERIOD_US   = 1000;  // 1 kHz control update + encoder sample
@@ -86,20 +105,20 @@ const uint32_t RING_SIZE          = 4096;  // ~4 s of buffering if the network s
 static_assert((RING_SIZE & (RING_SIZE - 1)) == 0, "RING_SIZE must be a power of two");
 
 // ============================================================================
-// STATE PACKET (version 2) - published on stateTopic, little-endian, packed
+// STATE PACKET (version 3) - published on stateTopic, little-endian, packed
 // ----------------------------------------------------------------------------
 //   PacketHeader (20 bytes) followed by sampleCount x Sample (12 bytes each)
 //   Python: header '<HHIIff', then each sample '<Iif'
 // ============================================================================
-const uint16_t PACKET_VERSION = 2;
+const uint16_t PACKET_VERSION = 3;
 
 struct __attribute__((packed)) PacketHeader {
   uint16_t version;         // PACKET_VERSION
   uint16_t sampleCount;     // number of samples that follow
   uint32_t sequence;        // packet counter since boot; a gap = MQTT lost a packet
   uint32_t droppedSamples;  // samples lost on the Teensy (buffer overflow), cumulative since boot
-  float current;            // batch-rate, uncalibrated (sensors not wired yet)
-  float voltage;            // batch-rate, uncalibrated (sensors not wired yet)
+  float currentSensorV;     // current sensor pin voltage, averaged over this packet (V)
+  float voltageSensorV;     // voltage sensor pin voltage, averaged over this packet (V)
 };
 static_assert(sizeof(PacketHeader) == 20, "PacketHeader must be 20 bytes");
 
@@ -132,17 +151,17 @@ uint8_t packetBuf[sizeof(PacketHeader) + SAMPLES_PER_PACKET * sizeof(Sample)];
 IntervalTimer sampleTimer;
 Encoder wheelEncoder(WHEEL_ENCODER_A_PIN, WHEEL_ENCODER_B_PIN);
 
-float latestCurrent = 0.0f;
-float latestVoltage = 0.0f;
-float currentScale = 0.12f;
-float voltageScale = 0.12f;
+// Analog sensor averages (main loop only)
+uint32_t analogSamples = 0;
+uint32_t currentRawSum = 0;
+uint32_t voltageRawSum = 0;
+float currentSensorV = NAN;                  // latest packet-period averages, V at the pin
+float voltageSensorV = NAN;                  // (NaN until the first average; the PC shows "no data")
 
 // ============================================================================
 // SLOW TIMERS (main loop)
 // ============================================================================
-const unsigned int analogTimerPeriod = 100;    // ms
 const unsigned int debugTimerPeriod  = 500;    // ms - Serial Monitor printout
-TimerEvent analogTimer;
 TimerEvent debugTimer;
 
 // ============================================================================
@@ -264,6 +283,9 @@ PubSubClient client(brokerIP, brokerPort, onMessageReceived, ethClient);
 // PUBLISH - send every full batch of samples waiting in the ring buffer
 // ============================================================================
 void publishPendingSamples() {
+  if (ringHead - ringTail >= SAMPLES_PER_PACKET) {
+    takeAnalogAverages();
+  }
   while (ringHead - ringTail >= SAMPLES_PER_PACKET) {
     __sync_synchronize();        // see the samples the ISR finished writing
 
@@ -272,8 +294,8 @@ void publishPendingSamples() {
     header.sampleCount = SAMPLES_PER_PACKET;
     header.sequence = packetSequence++;
     header.droppedSamples = droppedSamples;
-    header.current = latestCurrent;
-    header.voltage = latestVoltage;
+    header.currentSensorV = currentSensorV;
+    header.voltageSensorV = voltageSensorV;
     memcpy(packetBuf, &header, sizeof(header));
 
     uint32_t tail = ringTail;
@@ -291,11 +313,27 @@ void publishPendingSamples() {
 }
 
 // ============================================================================
-// ANALOG TIMER CALLBACK TO READ VOLTAGE AND CURRENT
+// ANALOG SENSORS - sampled from loop() at ~1 kHz, averaged per packet.
+// (Not in the ISR: analogRead() calls yield() while it waits.)
 // ============================================================================
-void analogTimerCallback() {
-  latestCurrent = currentScale * analogRead(CURRENT_SENSOR_PIN);
-  latestVoltage = voltageScale * analogRead(VOLTAGE_SENSOR_PIN);
+void sampleAnalog() {
+  static uint32_t lastUs = 0;
+  uint32_t now = micros();
+  if (now - lastUs < ANALOG_PERIOD_US) return;
+  lastUs = now;
+  currentRawSum += analogRead(CURRENT_SENSOR_PIN);
+  voltageRawSum += analogRead(VOLTAGE_SENSOR_PIN);
+  analogSamples++;
+  if (analogSamples >= 1000) takeAnalogAverages();  // not publishing (MQTT down): keep sums small
+}
+
+// Average everything sampled since the last call. If nothing was sampled
+// (loop blocked, e.g. reconnecting), the previous averages are kept.
+void takeAnalogAverages() {
+  if (analogSamples == 0) return;
+  currentSensorV = (float)currentRawSum / analogSamples * ADC_VREF / ADC_MAX;
+  voltageSensorV = (float)voltageRawSum / analogSamples * ADC_VREF / ADC_MAX;
+  analogSamples = currentRawSum = voltageRawSum = 0;
 }
 
 // ============================================================================
@@ -316,11 +354,12 @@ void debugTimerCallback() {
 
   if (!Serial) return;  // only print when the Serial Monitor is open
   Serial.printf("enc=%ld (A=%d B=%d) rev=%.2f rpm=%.0f | target=%+.2f out=%+.2f | "
-                "mqtt=%s pkts=%lu dropped=%lu\n",
+                "isense=%.3fV vsense=%.3fV | mqtt=%s pkts=%lu dropped=%lu\n",
                 (long)count,
                 digitalRead(WHEEL_ENCODER_A_PIN), digitalRead(WHEEL_ENCODER_B_PIN),
                 count / COUNTS_PER_REV, rpm,
                 (float)targetEffort, (float)currentEffort,
+                currentSensorV, voltageSensorV,
                 client.connected() ? "up" : "DOWN",
                 (unsigned long)packetSequence, (unsigned long)droppedSamples);
 }
@@ -373,10 +412,13 @@ void setup() {
   pinMode(DIRECTION_PIN, OUTPUT_OPENDRAIN);
   digitalWrite(DIRECTION_PIN, HIGH);  // released = forward; idle state
 
+  analogReadResolution(ADC_BITS);
+  analogReadAveraging(4);
+
   Serial.begin(115200);
   delay(2000);  // Wait for Serial Monitor to connect
 
-  Serial.printf("\n=== Teensy 4.1 Motor Node %d ===\n", MOTOR_ID);
+  Serial.printf("\n=== Teensy 4.1 Motor Node %s ===\n", MOTOR_NAME);
   Serial.printf("State topic:   %s\nCommand topic: %s\n", stateTopic, commandTopic);
   Serial.printf("Sampling at %d Hz, %d samples/packet, packet version %d\n",
                 1000000 / SAMPLE_PERIOD_US, SAMPLES_PER_PACKET, PACKET_VERSION);
@@ -398,7 +440,6 @@ void setup() {
   // Connect to MQTT broker
   connectToBroker();
 
-  analogTimer.set(analogTimerPeriod, analogTimerCallback);
   debugTimer.set(debugTimerPeriod, debugTimerCallback);
 
   // Start the 1 kHz control + sampling interrupt. Lower priority (higher
@@ -409,7 +450,7 @@ void setup() {
 }
 
 // ============================================================================
-// MAIN LOOP - networking only; control + sampling run in sampleISR()
+// MAIN LOOP - networking + analog sensors; control + encoder run in sampleISR()
 // ============================================================================
 void loop() {
   // Maintain Ethernet connection
@@ -437,6 +478,6 @@ void loop() {
     Serial.println("! Command timeout - target set to 0");
   }
 
-  analogTimer.update();
+  sampleAnalog();
   debugTimer.update();
 }

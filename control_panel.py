@@ -3,7 +3,7 @@
 
 Serves control_panel/index.html at http://127.0.0.1:8080 (this PC only) and
 bridges it to MQTT:
-  - streams live state for motors 1-4 to the page (Server-Sent Events, 10 Hz)
+  - streams live state for the LF/RF/LR/RR motors to the page (Server-Sent Events, 10 Hz)
   - takes effort commands from the page and publishes them at 20 Hz
   - records any motor's 1 kHz data to data/motor_<id>/*.csv, one at a time or all at once
   - runs the step / sweep tests from utils/test_profiles.py (same CSVs as the scripts)
@@ -38,14 +38,15 @@ sys.path.insert(0, os.path.join(REPO_DIR, 'utils'))
 from mqtt_handler import MQTTHandler
 from data_manager import DataManager, parse_state_packet, ENCODER_COUNTS_PER_REV
 from test_profiles import step_plan, sweep_plan
+from motors import MOTORS, command_topic
+from sensors import current_sensor, voltage_sensor
 
 BROKER_IP = "192.168.10.1"
 BROKER_PORT = 1883
-MOTOR_IDS = (1, 2, 3, 4)
-# Motors whose current/voltage sensors are wired AND calibrated in the firmware
-# (currentScale / voltageScale). Others show "sensors not wired" on the page,
-# because unconnected analog pins read meaningless values. Example: {1, 2}
-POWER_SENSORS = set()
+MOTOR_IDS = MOTORS   # ("LF", "RF", "LR", "RR")
+# Which motors have current/voltage sensors, and their calibration, is set in
+# utils/sensors.py. Motors not listed there show "not wired" on the page, because
+# unconnected analog pins read meaningless values.
 PAGE_PATH = os.path.join(REPO_DIR, "control_panel", "index.html")
 DATA_DIR = os.path.join(REPO_DIR, "data")
 
@@ -64,12 +65,17 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _round(value, digits):
+    """Round for the page; None for a missing value (NaN isn't valid JSON)."""
+    return None if value is None or math.isnan(value) else round(value, digits)
+
+
 class Conflict(ValueError):
     """The request is valid but not allowed right now (HTTP 409)."""
 
 
 class Motor:
-    def __init__(self, motor_id: int):
+    def __init__(self, motor_id: str):
         self.id = motor_id
         self.target = 0.0
         self.zero_until = 0.0
@@ -77,8 +83,8 @@ class Motor:
         self.count = 0
         self.effort_out = 0.0
         self.rpm = 0.0
-        self.current = 0.0               # A (from the packet header, ~20 Hz)
-        self.voltage = 0.0               # V
+        self.current_sensor_v = math.nan # sensor pin volts from the packet header (20 Hz)
+        self.voltage_sensor_v = math.nan
         self.last_seq = None
         self.lost = 0
         self.dropped = 0
@@ -115,14 +121,14 @@ class Panel:
         self.mqtt.connect()
         threading.Thread(target=self._command_loop, daemon=True).start()
 
-    def _publish(self, motor_id: int, effort: float):
+    def _publish(self, motor_id: str, effort: float):
         if self.mqtt.connected:
-            self.mqtt.publish_effort(f"robot/motor/{motor_id}/command", effort)
+            self.mqtt.publish_effort(command_topic(motor_id), effort)
 
     def _on_state(self, msg):
         try:
-            motor = self.motors.get(int(msg.topic.split('/')[2]))
-        except (IndexError, ValueError):
+            motor = self.motors.get(msg.topic.split('/')[2])
+        except IndexError:
             return
         if motor is None:
             return
@@ -144,7 +150,8 @@ class Panel:
             motor.last_seq = packet.sequence
             motor.dropped = packet.dropped_samples
             motor.count, motor.effort_out, motor.rpm = count, effort_out, rpm
-            motor.current, motor.voltage = packet.current, packet.voltage
+            motor.current_sensor_v = packet.current_sensor_v
+            motor.voltage_sensor_v = packet.voltage_sensor_v
             motor.last_packet = time.monotonic()
             motor.points.append((motor.next_idx, round(self._now(), 3), round(rpm, 1),
                                  round(effort_out, 4), motor.target))
@@ -185,7 +192,7 @@ class Panel:
         return time.monotonic() - self.t0
 
     # -------------------------------------------------------------- commands
-    def _set_target(self, motor_id: int, effort: float):
+    def _set_target(self, motor_id: str, effort: float):
         effort = max(-1.0, min(1.0, effort))
         with self.lock:
             motor = self.motors[motor_id]
@@ -195,13 +202,13 @@ class Panel:
         self._publish(motor_id, effort)      # send now; the loop keeps it alive after
         log(f"motor {motor_id} -> {effort:+.2f}")
 
-    def command(self, motor_id: int, effort: float):
+    def command(self, motor_id: str, effort: float):
         with self.lock:
             if self.motors[motor_id].test_active:
                 raise Conflict("a test is running on this motor; abort it first")
         self._set_target(motor_id, effort)
 
-    def stop(self, motor_id: int, reason: str):
+    def stop(self, motor_id: str, reason: str):
         self.abort_test(motor_id, reason)
         self._set_target(motor_id, 0.0)
 
@@ -232,7 +239,7 @@ class Panel:
                 f"saved recordings {recording}")
 
     # ------------------------------------------------------------- recording
-    def start_recording(self, motor_id: int, notes: str, test_type: str = "manual",
+    def start_recording(self, motor_id: str, notes: str, test_type: str = "manual",
                         tag: str = "panel", params: dict = None, owner: str = "manual"):
         with self.lock:
             motor = self.motors[motor_id]
@@ -249,7 +256,7 @@ class Panel:
             motor.record_status = {"state": "recording", "file": os.path.relpath(path, REPO_DIR)}
         log(f"motor {motor_id}: recording to {os.path.relpath(path, REPO_DIR)}")
 
-    def stop_recording(self, motor_id: int, owner: str = None, wait: bool = False):
+    def stop_recording(self, motor_id: str, owner: str = None, wait: bool = False):
         with self.lock:
             motor = self.motors[motor_id]
             recorder = motor.recorder
@@ -318,7 +325,7 @@ class Panel:
                               params.get("hold"), params.get("direction"))
         raise ValueError("test kind must be 'step' or 'sweep'")
 
-    def start_test(self, motor_id: int, kind: str, params: dict, notes: str):
+    def start_test(self, motor_id: str, kind: str, params: dict, notes: str):
         plan = self.make_plan(kind, params)
         now = time.monotonic()
         with self.lock:
@@ -389,7 +396,7 @@ class Panel:
                 motor.test_thread = None
             log(f"motor {motor.id}: test {'aborted (' + reason + ')' if reason else 'complete'}")
 
-    def abort_test(self, motor_id: int, reason: str) -> bool:
+    def abort_test(self, motor_id: str, reason: str) -> bool:
         """Ask a running test to stop. Returns True if one was running."""
         with self.lock:
             motor = self.motors[motor_id]
@@ -430,7 +437,7 @@ class Panel:
                     summary = m.recorder.summary()
                     record.update(samples=summary["samples"], duration_s=summary["duration_s"])
                 record["owner"] = m.recorder_owner
-                wired = m.id in POWER_SENSORS
+                cs, vs = current_sensor(m.id), voltage_sensor(m.id)
                 motors.append({
                     "id": m.id,
                     "seen": m.last_packet is not None,
@@ -442,9 +449,13 @@ class Panel:
                     "count": m.count,
                     "rev": round(m.count / ENCODER_COUNTS_PER_REV, 2),
                     "electrical": {
-                        "wired": wired,
-                        "voltage": round(m.voltage, 2) if wired else None,
-                        "current": round(m.current, 2) if wired else None,
+                        "current_wired": cs is not None,
+                        "current_calibrated": bool(cs and cs.calibrated),
+                        "current": _round(cs.amps(m.current_sensor_v), 2) if cs else None,
+                        "current_pin_v": _round(m.current_sensor_v, 3) if cs else None,
+                        "voltage_wired": vs is not None,
+                        "voltage_calibrated": bool(vs and vs.calibrated),
+                        "voltage": _round(vs.volts(m.voltage_sensor_v), 2) if vs else None,
                     },
                     "lost": m.lost,
                     "dropped": m.dropped,
@@ -598,9 +609,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
     @staticmethod
-    def _motor(body: dict) -> int:
+    def _motor(body: dict) -> str:
         motor_id = body.get("motor")
-        if isinstance(motor_id, bool) or motor_id not in MOTOR_IDS:
+        if not isinstance(motor_id, str) or motor_id not in MOTOR_IDS:
             raise ValueError(f"motor must be one of {list(MOTOR_IDS)}")
         return motor_id
 

@@ -13,6 +13,7 @@ import time
 from mqtt_handler import MQTTHandler
 from data_manager import DataManager, parse_state_packet
 from test_profiles import TestPlan
+from motors import command_topic, state_topic
 
 BROKER_IP = "192.168.10.1"
 BROKER_PORT = 1883
@@ -20,11 +21,11 @@ COMMAND_RATE_HZ = 20     # well inside the firmware's 1 s command watchdog
 PRINT_RATE_HZ = 2
 
 
-def run_profile(motor_id: int, plan: TestPlan, notes: str = "") -> None:
+def run_profile(motor_id: str, plan: TestPlan, notes: str = "") -> None:
     """Run plan.profile(t) for t in [0, plan.duration_s] and record the motor's state."""
     profile, duration_s = plan.profile, plan.duration_s
-    topic_cmd = f"robot/motor/{motor_id}/command"
-    topic_state = f"robot/motor/{motor_id}/state"
+    topic_cmd = command_topic(motor_id)
+    topic_state = state_topic(motor_id)
 
     mqtt_handler = MQTTHandler(BROKER_IP, BROKER_PORT)
     data_manager = DataManager()

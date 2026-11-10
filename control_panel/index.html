@@ -90,6 +90,7 @@
   .elec .elec-label { font-weight: 650; color: var(--text); }
   .elec b { color: var(--text); font-weight: 600; }
   .elec .tag { margin-left: auto; font-size: 11.5px; font-style: italic; }
+  .elec small { font-size: 11.5px; }
 
   canvas { width: 100%; height: 180px; display: block; }
   .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: -4px; }
@@ -189,7 +190,7 @@
   Commands are sent only after you press Apply (or Enter). Stop and STOP ALL ramp the output down at the
   firmware rate (0.25/s), so they are not instant; for an emergency use the HV killswitch.
   If this page closes, the server aborts tests and stops the motors it was driving within about 1 s.
-  The shaded band on each effort strip is the controller's dead band (motor 1 measured: starts at about ±0.42).
+  The shaded band on each effort strip is the controller's dead band (LF measured: starts at about ±0.42).
 </footer>
 
 <template id="cardTpl">
@@ -209,10 +210,10 @@
         <span>count</span><b data-r="count">—</b>
       </div>
     </div>
-    <div class="elec live" data-r="elec" title="Current/voltage sensors. Enable per motor with POWER_SENSORS in control_panel.py once wired and calibrated.">
+    <div class="elec live" data-r="elec" title="Current/voltage sensors. Which motors have them, and their calibration, is set in utils/sensors.py.">
       <span class="elec-label">Electrical</span>
+      <span>current <b data-r="amps">—</b> <small data-r="isense"></small></span>
       <span>voltage <b data-r="volt">—</b></span>
-      <span>current <b data-r="amps">—</b></span>
       <span>power <b data-r="watts">—</b></span>
       <span class="tag" data-r="elecNote">sensors not wired</span>
     </div>
@@ -297,10 +298,10 @@
 <script>
 'use strict';
 
-const MOTOR_IDS = [1, 2, 3, 4];
+const MOTOR_IDS = ['LF', 'RF', 'LR', 'RR'];   // must match utils/motors.py
 const WINDOWS = [10, 30, 120];   // chart window choices (s)
 const MAX_WINDOW_S = 120;
-const DEADBAND = 0.42;           // controller start threshold, motor 1 measured 2026-11-02
+const DEADBAND = 0.42;           // controller start threshold, LF (old motor 1) measured 2026-11-02
 const GAP_S = 0.5;               // break chart lines across gaps longer than this
 
 const cards = {};
@@ -378,7 +379,7 @@ function buildCards() {
     const node = tpl.content.firstElementChild.cloneNode(true);
     const r = {};
     node.querySelectorAll('[data-r]').forEach(el => { r[el.dataset.r] = el; });
-    r.title.textContent = 'Motor ' + id;
+    r.title.textContent = id + ' motor';
     r.db.style.left = ((1 - DEADBAND) * 50) + '%';
     r.db.style.right = ((1 - DEADBAND) * 50) + '%';
 
@@ -575,18 +576,26 @@ function updateCard(c, m) {
   }
   r.target.textContent = fmtSigned(m.target, 2);
 
-  const el = m.electrical || { wired: false };
-  const showElec = el.wired && m.online && el.voltage !== null && el.current !== null;
-  r.elec.classList.toggle('wired', !!el.wired);
-  if (showElec) {
-    r.volt.textContent = el.voltage.toFixed(1) + ' V';
-    r.amps.textContent = fmtSigned(el.current, 1) + ' A';
-    r.watts.textContent = fmtSigned(el.voltage * el.current, 0) + ' W';
-    r.elecNote.textContent = '';
-  } else {
-    r.volt.textContent = r.amps.textContent = r.watts.textContent = '—';
-    r.elecNote.textContent = el.wired ? 'no data' : 'sensors not wired';
-  }
+  // Current and voltage sensors are independent: either can be wired alone.
+  // Power needs both.
+  const el = m.electrical || {};
+  const anyWired = !!(el.current_wired || el.voltage_wired);
+  const amps = m.online && el.current_wired && el.current != null ? el.current : null;
+  const volts = m.online && el.voltage_wired && el.voltage != null ? el.voltage : null;
+  r.elec.classList.toggle('wired', anyWired);
+  r.amps.textContent = amps !== null ? fmtSigned(amps, 2) + ' A'
+                                     : (el.current_wired ? '—' : 'not wired');
+  r.isense.textContent = amps !== null && el.current_pin_v != null
+                       ? '(' + el.current_pin_v.toFixed(3) + ' V at pin)' : '';
+  r.volt.textContent = volts !== null ? volts.toFixed(1) + ' V'
+                                      : (el.voltage_wired ? '—' : 'not wired');
+  r.watts.textContent = amps !== null && volts !== null ? fmtSigned(volts * amps, 0) + ' W' : '—';
+  const uncal = [];
+  if (el.current_wired && !el.current_calibrated) uncal.push('current');
+  if (el.voltage_wired && !el.voltage_calibrated) uncal.push('voltage');
+  r.elecNote.textContent = !anyWired ? 'sensors not wired'
+                         : !m.online ? 'no data'
+                         : uncal.length ? uncal.join(' & ') + ' uncalibrated' : '';
 
   r.lost.textContent = m.lost;
   r.dropped.textContent = m.dropped;

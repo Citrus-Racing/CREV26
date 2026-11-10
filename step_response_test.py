@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from test_runner import run_profile
 from test_profiles import step_plan
+from motors import MOTORS
 
 
 def get_user_input() -> dict:
@@ -20,7 +21,11 @@ def get_user_input() -> dict:
     print("STEP RESPONSE TEST - USER INPUT")
     print("=" * 60 + "\n")
 
-    motor_id = int(input("Enter motor ID (1-4): "))
+    while True:
+        motor_id = input(f"Enter motor ({', '.join(MOTORS)}): ").strip().upper()
+        if motor_id in MOTORS:
+            break
+        print(f"  ✗ Motor must be one of {', '.join(MOTORS)}")
 
     while True:
         effort = float(input("Enter effort level (-1.0 to 1.0): "))

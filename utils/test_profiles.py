@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List
 
 FIRMWARE_RAMP_PER_S = 0.25   # firmware RAMP_UP_PER_S; faster profiles lag behind it
-CONTROLLER_DEADBAND = 0.42   # motor won't start below this |effort| (motor 1 measured)
+CONTROLLER_DEADBAND = 0.42   # motor won't start below this |effort| (LF, old motor 1, measured)
 SWEEP_REST_S = 2.0           # at 0 before/after each sweep so the motor fully stops
 MAX_TEST_S = 3600.0
 

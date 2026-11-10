@@ -1,9 +1,13 @@
 """State-packet parsing and CSV logging for the motor nodes.
 
-Packet format (version 2, little-endian, must match firmware/motor_node):
+Packet format (version 3, little-endian, must match firmware/motor_node):
   header  '<HHIIff' (20 bytes): version, sample_count, sequence, dropped_samples,
-                                current, voltage   (current/voltage: batch-rate, uncalibrated)
+                                current_sensor_v, voltage_sensor_v
+          The last two are the current/voltage sensor pin voltages (0-3.3 V), averaged
+          over the packet. utils/sensors.py converts them to amps and volts.
   samples '<Iif'    (12 bytes each): timestamp_us, encoder_count, effort
+Version 2 is the same layout, but its two analog fields were placeholders, so they
+are read as NaN. Drop version 2 once every board runs version 3 firmware.
 """
 
 import csv
@@ -13,13 +17,16 @@ import struct
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from sensors import current_sensor, voltage_sensor, describe as describe_sensors
 
 # Must match firmware: 600 P/R encoder, 4x decoding by the Encoder library
 ENCODER_COUNTS_PER_REV = 2400
 RAD_PER_COUNT = 2.0 * math.pi / ENCODER_COUNTS_PER_REV
 
-PACKET_VERSION = 2
+PACKET_VERSION = 3
+LEGACY_PACKET_VERSIONS = (2,)   # same layout, analog fields meaningless
 HEADER_FMT = '<HHIIff'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 20
 SAMPLE_FMT = '<Iif'
@@ -35,8 +42,8 @@ VELOCITY_HALF_WINDOW = 5
 class StatePacket:
     sequence: int
     dropped_samples: int
-    current: float
-    voltage: float
+    current_sensor_v: float   # current sensor pin voltage, V (NaN if unavailable)
+    voltage_sensor_v: float   # voltage sensor pin voltage, V (NaN if unavailable)
     samples: List[Tuple[int, int, float]]   # (timestamp_us, encoder_count, effort)
 
     def velocity_rad_s(self) -> float:
@@ -50,14 +57,21 @@ def parse_state_packet(payload: bytes) -> StatePacket:
     """Parse one batched state packet from a motor node. Raises ValueError if malformed."""
     if len(payload) < HEADER_SIZE:
         raise ValueError(f"Packet too short ({len(payload)} bytes)")
-    version, n, sequence, dropped, current, voltage = struct.unpack_from(HEADER_FMT, payload)
-    if version != PACKET_VERSION:
+    version, n, sequence, dropped, current_v, voltage_v = struct.unpack_from(HEADER_FMT, payload)
+    if version in LEGACY_PACKET_VERSIONS:
+        current_v = voltage_v = math.nan
+    elif version != PACKET_VERSION:
         raise ValueError(f"Packet version {version} != {PACKET_VERSION} "
                          f"({len(payload)} bytes). Firmware and utils/ don't match; reflash the Teensy.")
     if len(payload) != HEADER_SIZE + n * SAMPLE_SIZE or n == 0:
         raise ValueError(f"Packet says {n} samples but is {len(payload)} bytes")
     samples = list(struct.iter_unpack(SAMPLE_FMT, payload[HEADER_SIZE:]))
-    return StatePacket(sequence, dropped, current, voltage, samples)
+    return StatePacket(sequence, dropped, current_v, voltage_v, samples)
+
+
+def _fmt(value: Optional[float], digits: int) -> str:
+    """CSV cell: empty for a missing value (None or NaN)."""
+    return "" if value is None or math.isnan(value) else f"{value:.{digits}f}"
 
 
 class DataManager:
@@ -68,10 +82,12 @@ class DataManager:
 
     def __init__(self, data_dir: str = "data"):
         self.data_dir = data_dir
+        self.motor_id = None
         self.csv_file = None
         self.metadata: Dict[str, Any] = {}
         self._lock = threading.Lock()
-        # rows: (timestamp_us_raw, timestamp_us_unwrapped, encoder_count, effort, current, voltage)
+        # rows: (timestamp_us_raw, timestamp_us_unwrapped, encoder_count, effort,
+        #        current_sensor_v, voltage_sensor_v)
         self._rows: List[Tuple[int, int, int, float, float, float]] = []
         self._last_seq = None
         self._packets = 0
@@ -85,7 +101,7 @@ class DataManager:
     def has_data(self) -> bool:
         return bool(self._rows)
 
-    def create_test_file(self, motor_id: int, test_type: str, tag: str,
+    def create_test_file(self, motor_id: str, test_type: str, tag: str,
                          params: Dict[str, Any], notes: str = "",
                          broker_ip: str = "192.168.10.1") -> str:
         """Choose the CSV path for this run and record its metadata. Nothing is written yet."""
@@ -95,6 +111,7 @@ class DataManager:
         now = datetime.now(timezone.utc)
         filename = f"{now:%Y-%m-%dT%H-%M-%S}_motor{motor_id}_{test_type}_{tag}.csv"
         self.csv_file = os.path.join(motor_dir, filename)
+        self.motor_id = motor_id
 
         self.metadata = {
             "timestamp": now.isoformat(timespec="seconds"),
@@ -105,6 +122,7 @@ class DataManager:
             "encoder_counts_per_rev": ENCODER_COUNTS_PER_REV,
             "velocity_window_ms": 2 * VELOCITY_HALF_WINDOW * 1000 / NOMINAL_SAMPLE_RATE_HZ,
             "broker_ip": broker_ip,
+            **describe_sensors(motor_id),
             "notes": notes,
         }
         return self.csv_file
@@ -128,7 +146,7 @@ class DataManager:
                     self._ts_offset += 2**32
                 self._last_ts = ts
                 self._rows.append((ts, ts + self._ts_offset, count, effort,
-                                   packet.current, packet.voltage))
+                                   packet.current_sensor_v, packet.voltage_sensor_v))
 
     def summary(self) -> Dict[str, Any]:
         with self._lock:
@@ -159,6 +177,7 @@ class DataManager:
         times = [(r[1] - t0) * 1e-6 for r in rows]
         counts = [r[2] for r in rows]
         W = VELOCITY_HALF_WINDOW
+        cs, vs = current_sensor(self.motor_id), voltage_sensor(self.motor_id)
 
         with open(self.csv_file, 'w', newline='') as f:
             f.write("# METADATA\n")
@@ -169,8 +188,9 @@ class DataManager:
 
             writer = csv.writer(f)
             writer.writerow(["time_s", "timestamp_us", "effort", "encoder_count",
-                             "position_rad", "velocity_rad_s", "current_A", "voltage_V"])
-            for i, (ts_raw, _, count, effort, current, voltage) in enumerate(rows):
+                             "position_rad", "velocity_rad_s", "current_A", "voltage_V",
+                             "current_sensor_V", "voltage_sensor_V"])
+            for i, (ts_raw, _, count, effort, current_v, voltage_v) in enumerate(rows):
                 vel = ""
                 if W <= i < len(rows) - W:
                     dt = times[i + W] - times[i - W]
@@ -178,7 +198,9 @@ class DataManager:
                         vel = f"{(counts[i + W] - counts[i - W]) * RAD_PER_COUNT / dt:.4f}"
                 writer.writerow([f"{times[i]:.6f}", ts_raw, f"{effort:.5f}", count,
                                  f"{count * RAD_PER_COUNT:.6f}", vel,
-                                 f"{current:.3f}", f"{voltage:.3f}"])
+                                 _fmt(cs.amps(current_v) if cs else None, 3),
+                                 _fmt(vs.volts(voltage_v) if vs else None, 3),
+                                 _fmt(current_v, 4), _fmt(voltage_v, 4)])
 
         print(f"✓ Data saved to: {self.csv_file}")
         print(f"  {summary['samples']} samples over {summary['duration_s']} s "

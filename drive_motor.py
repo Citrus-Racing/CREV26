@@ -8,8 +8,8 @@ at 5 Hz, which keeps the Teensy's 1 s command watchdog from stopping the motor.
 
 Run monitor_state.py in a second terminal to watch position/velocity.
 
-Usage:  python3 drive_motor.py            # motor 1
-        python3 drive_motor.py --motor 2
+Usage:  python3 drive_motor.py            # LF
+        python3 drive_motor.py --motor RR
 """
 
 import argparse
@@ -21,6 +21,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'utils'))
 
 from mqtt_handler import MQTTHandler
+from motors import add_motor_arg, command_topic
 
 BROKER_IP = "192.168.10.1"
 BROKER_PORT = 1883
@@ -29,9 +30,9 @@ PUBLISH_PERIOD_S = 0.2  # 5 Hz
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive manual motor drive")
-    parser.add_argument("--motor", type=int, default=1, help="motor ID (1-4)")
+    add_motor_arg(parser)
     args = parser.parse_args()
-    topic = f"robot/motor/{args.motor}/command"
+    topic = command_topic(args.motor)
 
     target = {"effort": 0.0}
     stop = threading.Event()
