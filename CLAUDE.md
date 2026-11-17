@@ -6,6 +6,7 @@ If you ever have any questions about anything related to the setup just ask.
 
 ## Repo layout
 
+- `docs/ROADMAP.md`: the team's task roadmap (phases, owners, status, "done when"). Students edit it to claim and update tasks; keep it current when work lands.
 - Motors are named by wheel corner: `LF`, `RF`, `LR`, `RR` (`utils/motors.py` holds the list and topic helpers). LF is the board formerly called motor 1.
 - `firmware/motor_node/motor_node.ino`: Teensy 4.1 firmware **template**. It has an `#error`, so it can't be flashed by mistake.
   - Edit firmware here, then run `python3 firmware/make_corner_sketches.py`. That regenerates `firmware/motor_node_<corner>/motor_node_<corner>.ino` for all 4 corners. Those are what gets flashed, from the Arduino IDE or by Claude with `arduino-cli` (in `~/.local/bin`, using the IDE's `teensy:avr` core; see Working rules for when Claude may flash).
@@ -18,6 +19,12 @@ If you ever have any questions about anything related to the setup just ask.
   - Every 10 s, with the motor off, it checks pin 21 with the internal pull-up and pull-down to see whether the sensor is really driving it, and scans the other free analog pins for a driven signal.
   - When the user types `r` (or `r 0.7`) in the Serial Monitor, it ramps LF forward at 0.25/s, holds, ramps down, and reports how far the sensor output moved from its zero-current reading. Claude must never send `r`, since that commands the motor.
   - While it's on the board, LF is offline and `find_boards.py` reports LF as `SensorTest_LF`. That mismatch is expected; flashing `motor_node_LF` restores it.
+- `firmware/encoder_test/`: standalone stuck-encoder-channel test for any corner (USB name `EncoderTest`, no MQTT, serial at 115200).
+  - Every 0.5 s it shows, for A (18) and B (17), the edge counts, digital level and analog min/max voltage. It also counts edges on spare pins 14, 15, 16 and 19, so a moved wire can be tested before any firmware change.
+  - Every 10 s, with the shaft still, it checks each encoder pin with the internal pull-down and pull-up. That tells whether the external pull-up and wire actually reach the pin.
+  - It prints a diagnosis when one channel moves and the other doesn't.
+  - `r` / `r 0.6` / `r 0.6 60` spins the motor forward: effort, then seconds (default 20 s, max 120 s). Claude sends it only when the user explicitly asks Claude to spin that motor.
+  - While it's flashed, `find_boards.py` reports that corner as `EncoderTest` (expected).
 - `utils/data_manager.py`: state-packet parser plus CSV logging; counts lost packets and Teensy-dropped samples.
 - `utils/sensors.py`: per-corner current/voltage sensor table. Each entry holds the zero point, the sensitivity, and a `calibrated` flag. The firmware sends raw pin volts, and the conversion to amps and volts happens here, so calibrating is an edit to this file plus a restart of the panel or script, with no reflash. A corner that isn't listed shows "not wired".
 - `utils/test_profiles.py`: `step_plan()` and `sweep_plan()` build a validated `TestPlan` (profile, duration, CSV name and metadata, warnings). The scripts and the control panel both use these, so a test produces the same CSV either way. Add new test types here.
@@ -57,8 +64,7 @@ If you ever have any questions about anything related to the setup just ask.
   - Position is sent as raw int32 counts; Python converts to radians in double precision.
   - Velocity is computed on the PC. CSVs use a centered difference over 10 ms; raw counts are always logged too.
   - A `sequence` gap means MQTT lost a packet. A rising `dropped_samples` means the Teensy's buffer overflowed.
-  - The firmware and `utils/data_manager.py` must match. `PACKET_VERSION` is checked, and a mismatch prints "reflash the Teensy".
-  - Version 2 packets (same layout, placeholder analog fields) are still accepted, with their sensor values read as NaN. Drop `LEGACY_PACKET_VERSIONS` once all 4 boards run v3.
+  - The firmware and `utils/data_manager.py` must match. `PACKET_VERSION` is checked, and a mismatch prints "reflash the Teensy". All 4 boards have run v3 since 2026-11-10.
 
 ## Bench hardware notes
 
@@ -73,7 +79,11 @@ If you ever have any questions about anything related to the setup just ask.
     - Top speed (3769 rpm) is likely capped by the 3.3 V PWM. Scooter throttles normally reach full scale at about 4-5 V, and the motor should do about 4900 rpm.
     - Reverse at −0.5 gave −464 rpm, about 60% of forward. The user confirms reverse is factory speed-limited; it's untested at −1.0.
     - Speed tracks the throttle closely on the way down too, so the controller appears to brake actively rather than let the motor coast.
-- **Current sensor** (LF only so far, 2026-11-10): a WCS1600 hall-effect sensor (the conductor passes through its core) on a board with an MCP602 op-amp, powered from the Teensy's 3.3 V.
+- **Current sensors**: wired on all 4 corners as of 2026-11-12, all listed in `utils/sensors.py`, all uncalibrated.
+  - Zeros measured with the motors stopped: LF 1.708 V (2026-11-10), LR 1.671 V, RR 1.714 V.
+  - RF's board was disconnected, so its zero is a provisional 1.705 V and still needs measuring.
+  - The details below were found on LF and assumed to apply to the others.
+- **Current sensor details** (LF first, 2026-11-10): a WCS1600 hall-effect sensor (the conductor passes through its core) on a board with an MCP602 op-amp, powered from the Teensy's 3.3 V.
   - AOUT goes to pin 21, GND to Teensy GND. DOUT (a comparator threshold output) stays unconnected.
   - It reads 1.708 V at the pin at 0 A.
   - Sensitivity: the datasheet gives 22 mV/A at 5 V and says the output is ratiometric, so about 14.5 mV/A at 3.3 V. That's the starting value in `utils/sensors.py`. It hasn't been calibrated yet: the board's op-amp could change it, and the sign depends on which way the wire passes through the core.
@@ -88,7 +98,19 @@ If you ever have any questions about anything related to the setup just ask.
   - With 4x decoding that's 2400 counts/rev.
   - This unit is rated for 6400 rpm (per the user's spec; generic LPD3806 listings quote lower figures, so ignore those).
   - It's mounted directly on the motor shaft.
-- **Safety**: a physical killswitch on the HV lines kills everything, and the spinning parts are covered.
+- **HV power** (as of 2026-11-17; roadmap Tracks H and C):
+  - **Pack:** six cheap 12 V LFP batteries in series on the bottom of the cart, about 77 V nominal and about 87 V fully charged.
+    - Each battery has a built-in 20 A BMS. There's no datasheet, so the series limit is unknown.
+    - As a string they've been charged once with a 72 V charger. Before that, each was charged on its own with a 12 V charger.
+  - **Switching:** battery + goes to a normally open TE HCR 150 relay (V23132-A2001-A200, 12 V coil), then to screw-terminal distribution under the cart top.
+    - The relay is an automotive part with contacts rated 12 VDC, so it isn't rated to break this bus under load.
+    - The emergency-off button on top switches the coil, which runs from a 12 V brick on the cart's power strip.
+  - **Controllers:** cheap units sold as 72 V rated.
+  - **Planned supercap bank:** 36 × 500 F cells (owned) on breadboards, 6 per board, with balancing.
+    - A 10 A, 72 V-limited buck charger will charge it from the pack, and the motors will run from the bank.
+    - The E-stop must be re-wired first, since the bank keeps the bus live after the battery relay opens.
+  - The signal wiring is on solderless breadboards, so suspect loose contacts first when a reading jumps.
+- **Safety**: the emergency-off button on top of the cart opens the HV relay. The encoder holders guard the spinning shafts. A chain guard is required before any chain coupling.
 
 ## Working rules
 
