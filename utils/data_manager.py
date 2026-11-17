@@ -6,8 +6,6 @@ Packet format (version 3, little-endian, must match firmware/motor_node):
           The last two are the current/voltage sensor pin voltages (0-3.3 V), averaged
           over the packet. utils/sensors.py converts them to amps and volts.
   samples '<Iif'    (12 bytes each): timestamp_us, encoder_count, effort
-Version 2 is the same layout, but its two analog fields were placeholders, so they
-are read as NaN. Drop version 2 once every board runs version 3 firmware.
 """
 
 import csv
@@ -26,7 +24,6 @@ ENCODER_COUNTS_PER_REV = 2400
 RAD_PER_COUNT = 2.0 * math.pi / ENCODER_COUNTS_PER_REV
 
 PACKET_VERSION = 3
-LEGACY_PACKET_VERSIONS = (2,)   # same layout, analog fields meaningless
 HEADER_FMT = '<HHIIff'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 20
 SAMPLE_FMT = '<Iif'
@@ -58,9 +55,7 @@ def parse_state_packet(payload: bytes) -> StatePacket:
     if len(payload) < HEADER_SIZE:
         raise ValueError(f"Packet too short ({len(payload)} bytes)")
     version, n, sequence, dropped, current_v, voltage_v = struct.unpack_from(HEADER_FMT, payload)
-    if version in LEGACY_PACKET_VERSIONS:
-        current_v = voltage_v = math.nan
-    elif version != PACKET_VERSION:
+    if version != PACKET_VERSION:
         raise ValueError(f"Packet version {version} != {PACKET_VERSION} "
                          f"({len(payload)} bytes). Firmware and utils/ don't match; reflash the Teensy.")
     if len(payload) != HEADER_SIZE + n * SAMPLE_SIZE or n == 0:

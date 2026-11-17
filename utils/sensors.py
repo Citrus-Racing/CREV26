@@ -44,12 +44,21 @@ class VoltageSensor:
 # WCS1600 hall sensor (MCP602 op-amp board) on the Teensy's 3.3 V. The datasheet gives
 # 22 mV/A at 5 V and says the output is ratiometric, so ~14.5 mV/A at 3.3 V.
 # The board's op-amp could change that, so treat it as a starting point until calibrated.
-# zero_v is pin 21 measured with the motor stopped on 2026-11-10.
+# zero_v is each corner's pin 21 measured with its motor stopped (effort 0). Each
+# sensor's zero differs by tens of mV, so measure it per corner, not per type.
 WCS1600_3V3_V_PER_A = 0.022 * 3.3 / 5.0
 
 CURRENT_SENSORS = {
     "LF": CurrentSensor(zero_v=1.708, v_per_a=WCS1600_3V3_V_PER_A, calibrated=False,
                         note="WCS1600 at 3.3 V, datasheet sensitivity, zero measured 2026-11-10"),
+    # RF was offline on 2026-11-12 (board not connected), so its zero is provisional:
+    # 1.705 V, typical of the other three. Measure it with the motor stopped and replace.
+    "RF": CurrentSensor(zero_v=1.705, v_per_a=WCS1600_3V3_V_PER_A, calibrated=False,
+                        note="WCS1600 at 3.3 V, datasheet sensitivity, zero PROVISIONAL (not measured)"),
+    "LR": CurrentSensor(zero_v=1.671, v_per_a=WCS1600_3V3_V_PER_A, calibrated=False,
+                        note="WCS1600 at 3.3 V, datasheet sensitivity, zero measured 2026-11-12"),
+    "RR": CurrentSensor(zero_v=1.714, v_per_a=WCS1600_3V3_V_PER_A, calibrated=False,
+                        note="WCS1600 at 3.3 V, datasheet sensitivity, zero measured 2026-11-12"),
 }
 
 # Bus voltage sensors (pin 20). None are wired yet.
