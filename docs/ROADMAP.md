@@ -50,6 +50,9 @@ initials to Status.
 - **Done when** says what has to be true before a task counts as finished. If you
   think it's wrong, change it in the same commit and say why.
 - **Add tasks freely.** Put each one under the phase it unblocks.
+- **Working with Claude:** Claude Code runs on the bench PC and can help with any task, including reviewing KiCad from the `EV-Documentation` repo.
+  - The student who owns a design makes the changes in KiCad and commits them.
+  - Claude reads and reviews the design, and helps with calculations and firmware.
 - **Safety:** before you command a motor, read *Bench hardware notes* and *Working
   rules* in `CLAUDE.md`. The emergency-off button on top of the cart is the emergency stop.
 
@@ -83,7 +86,7 @@ As built (2026-11-17):
   - The emergency-off button on top switches the relay coil.
   - The coil runs from a 12 V power brick on the cart's power strip.
 - **Guarding:** the encoder holders cover the spinning shafts. There are no chains yet.
-- **Capacitor bank (owned, not in use yet):** 36 × 500 F supercaps on breadboards, 6 per board, with balancing.
+- **Capacitor bank (owned, not in use yet):** 36 identical 2.7 V, 500 F supercaps, soldered 6 in series per board with balancing on each board. Six boards in series make 36S.
 
 ---
 
@@ -111,7 +114,7 @@ Every task here needs the electrical advisor's sign-off.
 
 | # | Task | Done when | Owner | Status |
 |---|---|---|---|---|
-| H.1 | E-stop relay rated for the bus | The HCR 150 is a 12 V automotive relay; TE rates its contacts at 12 VDC, so opening it under load at about 77 V may arc or weld the contacts. It's replaced by a DC contactor rated to break at least 100 VDC at our current, or the advisor has documented why it's acceptable | | todo |
+| H.1 | Replace the E-stop relay with a 100 VDC contactor | The HCR 150 (contacts rated 12 VDC) is replaced by a contactor rated to break at least 100 VDC at our current. Decided 2026-11-17 | | todo |
 | H.2 | Main DC fuse | A fuse rated for at least 100 VDC sits close to battery +, ahead of everything else, with a fuse per controller at the distribution terminals | | todo |
 | H.3 | E-stop also stops the controllers | The button's second contact (or a relay) cuts each controller's ignition/enable line, so the controllers stop driving before the HV relay has to break current | | todo |
 | H.4 | Battery check procedure | A written procedure measures each 12 V battery separately and tops up any that differ, using the 12 V charger. It's run and logged before test days | | todo |
@@ -127,10 +130,15 @@ including from regenerative braking, and we want to measure that swing.
 
 | # | Task | Done when | Owner | Status |
 |---|---|---|---|---|
-| C.1 | Characterize the bank on paper | The cell voltage rating, balancer threshold and series/parallel layout are written down, with the total capacitance, maximum voltage and stored energy | | todo |
-| C.2 | Bank wiring rated for motor current | Cells are joined by soldered or bolted bus bars sized for the peak motor current. Solderless breadboard contacts (about 1 A) carry no motor current | | todo |
+| C.1 | Characterize the bank on paper | The layout is known: 36S of 2.7 V / 500 F cells, about 13.9 F, 97.2 V max. Stored energy is about 36 kJ at 72 V and 66 kJ at 97 V. Charging 0→72 V at 10 A takes about 100 s. Still to write down: the balancer's clamp voltage and current, and what joins the six boards together | | in progress |
+| C.2 | Bank wiring rated for motor current | The soldered joints on each board, and the links between boards, are checked or upgraded to carry the peak motor current. The six boards are mounted, insulated and covered so nothing can short across the bank | | todo |
 | C.3 | Discharge and indication | A bleed resistor and a visible voltage indicator are on the bank, with a written procedure to discharge it and prove it dead before anyone touches it | | todo |
-| C.4 | Charger: design (or buy) the 10 A / 72 V buck | A reviewed schematic (KiCad, in the repo), or a bought module, does current-limited then voltage-limited charging. Input parts are rated for at least 100 V, since the pack reaches about 87 V fully charged | | todo |
+| C.4a | Charger: bring the KiCad up to date | The KiCad in `EV-Documentation` (`Schematics/Current_Source/`) matches the soldered prototype, including the new transistors and inductor. It still shows the old PIC16F1769 version | charger student | todo |
+| C.4b | Charger: swap the PIC for a Teensy | The schematic uses a Teensy (the advisor's choice is a Teensy LC). Teensy pins take at most 3.3 V and aren't 5 V tolerant, so the feedback dividers are rescaled: today's 100k/4.02k gives 3.39 V at 87.6 V. ⚠ PJRC has discontinued the Teensy LC, so first count how many we own and decide whether to use a Teensy 4.0 instead | charger student | todo |
+| C.4c | Charger: current sensing | An output-current sensor is chosen, wired into the schematic and fitted to the prototype | charger student | todo |
+| C.4d | Charger: firmware | Teensy firmware does current-limited then voltage-limited charging, stops on faults, and has a set maximum output voltage | charger student | todo |
+| C.4e | Charger: staged power tests ⚡ | The prototype is run at low input voltage into a resistive load first, then raised step by step, before it ever charges the bank | charger student | todo |
+| C.4f | Charger: review ⚡ | The schematic and layout have passed ERC/DRC and an advisor review. Input parts are rated for at least 100 V, since the pack reaches about 87 V fully charged | | todo |
 | C.5 | Re-wire the E-stop for the bank | Pressing the button disconnects the bank from the controllers and switches in the bleed resistor, as well as opening the battery relay | | todo |
 | C.6 | Staged charge tests | The bank is charged in steps (one board first, then more, raising the voltage limit each time), with cell voltages and temperatures logged at each step | | todo |
 | C.7 | Run from the bank and measure the swing | Motors run from the bank with bus V logged at 1 kHz. A predefined abort voltage (below the caps' and controllers' limits) is enforced. The swing, including regen, is reported | | todo |
@@ -178,6 +186,7 @@ including from regenerative braking, and we want to measure that swing.
 | I.1 | Student onboarding README (**do first**: a new member just joined) | A new member can set up, run the panel and record a run without help | | todo |
 | I.2 | Shared data storage | There is an agreed place for CSVs (`data/` is git-ignored) | | todo |
 | I.3 | Git workflow | Branch and review rules for multiple contributors are written down | | todo |
+| I.4 | Agree a KiCad version | The team agrees on one KiCad version, which is installed on the bench PC. The charger schematic is KiCad 10 and its PCB KiCad 9, but the bench PC has 7.0, so Claude can't render it or run ERC/DRC until the upgrade | | blocked (asking the students) |
 
 ---
 
@@ -193,4 +202,4 @@ _Add notes here._
 
 ## Open questions
 
-1. What cell voltage rating and balancer type are on the supercap boards? (Needed for C.1.)
+_None right now._

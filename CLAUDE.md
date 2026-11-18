@@ -106,8 +106,12 @@ If you ever have any questions about anything related to the setup just ask.
     - The relay is an automotive part with contacts rated 12 VDC, so it isn't rated to break this bus under load.
     - The emergency-off button on top switches the coil, which runs from a 12 V brick on the cart's power strip.
   - **Controllers:** cheap units sold as 72 V rated.
-  - **Planned supercap bank:** 36 × 500 F cells (owned) on breadboards, 6 per board, with balancing.
+  - **Planned supercap bank:** 36 identical 2.7 V, 500 F cells (owned), soldered 6 in series per board with balancing, and 6 boards in series. That's about 13.9 F and 97.2 V max, storing about 36 kJ at 72 V.
     - A 10 A, 72 V-limited buck charger will charge it from the pack, and the motors will run from the bank.
+    - The charger design is in the separate public repo `Citrus-Racing/EV-Documentation`, under `Schematics/Current_Source/`. It's a KiCad 10 schematic and KiCad 9 PCB; the bench PC has KiCad 7.0, so `kicad-cli` can't open them until the team agrees an upgrade (roadmap I.4).
+      - A different student now owns it (as of 2026-11-17). Its soldered prototype has new transistors and a new inductor, and no current sensor or microcontroller yet.
+      - The controller is moving from a PIC16F1769 to a Teensy LC. PJRC has discontinued the LC.
+      - The KiCad in the repo is out of date, showing the PIC version. See roadmap C.4a–f.
     - The E-stop must be re-wired first, since the bank keeps the bus live after the battery relay opens.
   - The signal wiring is on solderless breadboards, so suspect loose contacts first when a reading jumps.
 - **Safety**: the emergency-off button on top of the cart opens the HV relay. The encoder holders guard the spinning shafts. A chain guard is required before any chain coupling.
@@ -116,6 +120,7 @@ If you ever have any questions about anything related to the setup just ask.
 
 - **The user runs anything that commands a motor to move.** Claude gives the exact commands to run, and must not publish to `robot/motor/+/command` until the user explicitly hands over that control.
 - Claude may passively subscribe to state topics. That's read-only and sends no commands.
+- **`EV-Documentation` (KiCad):** Claude reads and reviews it from a clone in the scratchpad, but doesn't commit there. The student who owns each design makes the KiCad changes.
 - Claude may read the Teensys' serial ports and compile firmware at any time. Before reading a port, check that the Arduino IDE's Serial Monitor (`teensy-monitor`) doesn't already have it open (`fuser /dev/ttyACM*`), because two readers split the output.
 - **Flashing:** Claude flashes only when the user asks. If a bigger task needs a reflash, Claude asks the user before flashing.
   - Once the user says to flash, go ahead. Don't wait for effort to read 0: the HV killswitch may be off while effort is non-zero.
